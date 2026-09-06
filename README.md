@@ -29,6 +29,21 @@
 - 文档：SKILL.md 为入口，操作细则见 `references/workflow.md` 与
   `references/pack-format.md`。
 
+## 适合这样用 / 搜索关键词
+
+如果你正在找这类能力，本技能可能合适：
+
+- “我想让 AI 记住我习惯先给结论再展开”
+- “每次任务收尾帮我复盘并积累经验”
+- “让 AI 记录我的偏好、减少重复追问”
+- “把我在另一台电脑/客户端积累的经验合并进来”
+- “帮我的技能根据使用反馈自我迭代”
+
+搜索标签：经验复盘、收尾复盘、自我迭代、技能进化、理解用户习惯、个性化、长期记忆、
+习惯校准、减少重复追问、跨设备经验整合；English: retrospective, reflection,
+lessons learned, self-iteration, understand user habits, personalization,
+long-term memory, habit calibration, cross-device merge。
+
 ## 已知限制（Beta 声明）
 
 - 仅声明支持 Windows + Python 3.10+；macOS/Linux 与其它客户端未经真实验收；

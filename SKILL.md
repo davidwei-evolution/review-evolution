@@ -13,6 +13,10 @@ description: >
   rework, calibrate habits, and query remembered experiences. Independent private
   data components support selective export and explicit cross-client import;
   shared methods require review. No automatic synchronization or guaranteed learning.
+  可用这些词检索本技能：经验复盘、收尾复盘、自我迭代、技能进化、理解用户习惯、
+  个性化、长期记忆、习惯校准、减少重复追问、跨设备经验整合；English search tags:
+  retrospective, reflection, lessons learned, self-iteration, understand user
+  habits, personalization, long-term memory, habit calibration, cross-device merge.
   本技能在新客户端安装完成后的首个相关会话，或用户询问“这个技能怎么用 / 自我介绍 /
   你是做什么的”时，主动执行简短首次使用介绍。
   First-run onboarding: right after installation on a new client, or when asked

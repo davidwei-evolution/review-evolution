@@ -4,10 +4,10 @@
   "data_schema": 1,
   "files": {
     ".gitignore": "928a724daf259c76d99489a321a2825fe6338d3e0a21cdb74c81f0b353fed77b",
-    "CHANGELOG.md": "141a067ece94079c6d048d523f54b8b7bc11ab87b236f745642ae7e22c6865f2",
+    "CHANGELOG.md": "142d64202374d05828f149e411bb946c4e5d4896d7501049a92d7f9d281605e9",
     "LICENSE": "be92c834fecd8f7db03a44e1f05bddc332dd60be00fb07ec1c724b0aa3d3433c",
-    "README.md": "5609ad712bbaa4b6d963dcaa4c17fdb28c950771f9b2de83d4f74f669c23004f",
-    "SKILL.md": "4173db6e3dd1906659a37342a7358759c6c234a3b5beec50c7e0b451c3431e17",
+    "README.md": "e2067bbd07e4eea02f3991198fcf2fae365a962959144a4bd76ef6f3e27a95f4",
+    "SKILL.md": "d8c40301e55ed20fe5a6edfa701c93b8d8d2a81b5c99a333593eb8a66e495573",
     "public-methods/README.md": "bbe36485b5ffabd255ee13752c07b724660e023850fa538452a319bb3d8f0f36",
     "public-methods/registry.json": "69b36cd45aa7106bb683145facff7ea04527cf2ed5d9496aad75f79bec05f5e7",
     "references/client-acceptance.md": "87c00608abcbe04fca19fb21931040d5075d487de6b030c2d6e1361908d9993a",
