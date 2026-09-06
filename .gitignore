@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.wb-state/
+profiles/
+legacy/
+installation.json
