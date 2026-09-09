@@ -43,11 +43,47 @@ def s1outcome(task_id='task-1',**kw):
     row.update(kw);return row
 
 class Components(unittest.TestCase):
+
+    def test_query_capture_avoids_record_reparse_read(self):
+        row=record(state='confirmed',confirmed_by='synthetic confirmation');e.add(self.root,row)
+        original=e.read
+        def guarded(path):
+            if Path(path).parent.name in ('records','events'):
+                raise AssertionError('Redundant record read')
+            return original(path)
+        with patch.object(e,'read',side_effect=guarded):
+            self.assertEqual(e.query(self.root)['records'][0]['id'],row['id'])
+
+    def test_query_capture_detects_same_size_mutation(self):
+        row=record(text='Before',state='confirmed',confirmed_by='synthetic confirmation');e.add(self.root,row)
+        target=self.root/'s1/records'/(row['id']+'.json')
+        prior=target.stat();original=e.decode_row;changed=[]
+        def mutate(data):
+            result=original(data)
+            if isinstance(result,dict) and result.get('id')==row['id'] and not changed:
+                changed.append(True)
+                target.write_bytes(target.read_bytes().replace(b'Before',b'After!'))
+                os.utime(target,ns=(prior.st_atime_ns,prior.st_mtime_ns))
+            return result
+        with patch.object(e,'decode_row',side_effect=mutate):
+            with self.assertRaisesRegex(ValueError,'changed during read'):e.query(self.root)
+        self.assertEqual(e.query(self.root)['records'][0]['text'],'After!')
+
+    def test_query_capture_no_cross_profile_or_stale_revision_cache(self):
+        other=self.base/'isolated';e.init(other)
+        row=record(text='Old',state='confirmed',confirmed_by='synthetic confirmation');e.add(self.root,row)
+        self.assertEqual(len(e.query(self.root)['records']),1)
+        self.assertEqual(e.query(other)['records'],[])
+        new=record(text='Corrected',state='confirmed',confirmed_by='synthetic confirmation',supersedes=row['id']);e.add(self.root,new)
+        states={r['id']:r['effective_state'] for r in e.query(self.root)['records']}
+        self.assertEqual(states[row['id']],'superseded')
+        self.assertEqual(states[new['id']],'confirmed')
+
     def test_intro_verified_version_and_current_capabilities(self):
         value=e.introduction()
         self.assertEqual(value['version'],cp.verify(e.CORE)['version'])
-        self.assertEqual({c['id'] for c in value['capabilities']},{'recall','personal-experience','error-review','skill-review','migration','outcomes','updates'})
-        self.assertEqual(value['profile_state'],'not-inspected')
+        self.assertEqual({c['id'] for c in value['capabilities']},{'recall','personal-experience','error-review','skill-review','migration','outcomes','updates','backup','diagnostics'})
+        self.assertIn(value['profile_state'],('bound-valid','needs-setup-or-repair','not-inspected'))
         for card in value['capabilities']:
             self.assertTrue(card['ability'] and card['example'] and card['advice'])
 
@@ -70,6 +106,45 @@ class Components(unittest.TestCase):
         self.assertNotIn('PRIVATE_SENTINEL',json.dumps(value))
         self.assertEqual(before,{p.relative_to(self.root).as_posix():st.hash_file(p) for p in self.root.rglob('*') if p.is_file()})
         self.assertEqual(e.introduction(profile=self.base/'missing')['profile_state'],'needs-setup-or-repair')
+
+    def test_intro_default_probe_reads_binding_metadata_only(self):
+        probe=self.base/'probe'/'installation.json'
+        with patch.object(e,'binding_path',return_value=probe):
+            self.assertEqual(e.introduction()['profile_state'],'needs-setup-or-repair')
+            self.assertFalse(probe.exists())
+        e.add(self.root,record(text='PROBE_SENTINEL_DO_NOT_REVEAL'))
+        bound=self.base/'bound'/'installation.json'
+        bound.parent.mkdir(parents=True)
+        bound.write_bytes(e.encoded({'schema':e.FORMAT,'core_series':'modular-1','profile_root':str(self.root)}))
+        with patch.object(e,'binding_path',return_value=bound):
+            value=e.introduction()
+        self.assertEqual(value['profile_state'],'bound-valid')
+        self.assertNotIn('PROBE_SENTINEL_DO_NOT_REVEAL',json.dumps(value))
+        bad=self.base/'bad'/'installation.json'
+        bad.parent.mkdir(parents=True)
+        bad.write_bytes(e.encoded({'schema':e.FORMAT,'profile_root':str(self.base/'missing')}))
+        with patch.object(e,'binding_path',return_value=bad):
+            self.assertEqual(e.introduction()['profile_state'],'needs-setup-or-repair')
+
+    def test_windows_launcher_scripts_ascii_and_in_manifest(self):
+        meta=e.read(e.CORE/'CORE.json')
+        for rel in ('scripts/re-cli.ps1','scripts/verify-core.ps1'):
+            self.assertIn(rel,meta['files'])
+            raw=(e.CORE/rel).read_bytes()
+            self.assertFalse(any(b>=128 for b in raw),rel+' must stay ASCII for PowerShell 5.1')
+        cli=(e.CORE/'scripts/re-cli.ps1').read_text(encoding='utf-8')
+        self.assertIn('Test-PythonVersionText',cli)
+
+    def test_compat_and_feedback_docs_bound_to_manifest_and_gate(self):
+        meta=e.read(e.CORE/'CORE.json')
+        for rel in ('references/compatibility-matrix.md','references/feedback-template.md'):
+            self.assertIn(rel,meta['files'])
+            self.assertTrue(gate.permitted(rel))
+        matrix=(e.CORE/'references/compatibility-matrix.md').read_text(encoding='utf-8')
+        self.assertIn('最低起点 v0.15.0-beta.1',matrix)
+        self.assertIn('core_api=2',matrix)
+        template=(e.CORE/'references/feedback-template.md').read_text(encoding='utf-8')
+        self.assertIn('unknown',template)
 
     def test_intro_tracks_changed_core_and_missing_capability(self):
         import shutil
@@ -632,6 +707,16 @@ class Components(unittest.TestCase):
         self.assertEqual(parsed, row)
         with self.assertRaises(FileNotFoundError):
             e.read_payload(str(self.base/'missing.json'))
+    def test_read_payload_stdin_accepts_utf8_bom(self):
+        row = record()
+        with patch('sys.stdin', io.StringIO('\ufeff'+json.dumps(row))):
+            self.assertEqual(e.read_payload('-'), row)
+    def test_validate_record_lists_all_missing_fields(self):
+        with self.assertRaises(ValueError) as cm:
+            e.validate_record({'id':'1'*32,'component':'s1'})
+        msg=str(cm.exception)
+        for field in ('module','scope','category','state','text','task_id','created_at','evidence'):
+            self.assertIn(field, msg)
     def test_query_multi_term_and_fuzzy(self):
         first = record(text='先给结论再给过程与依据', task_id='and-task')
         e.add(self.root, first)

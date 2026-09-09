@@ -37,6 +37,31 @@ CORE.json 仅允许核心版本、系列、API/schema、产品身份、开发状
 扫描不能可靠理解所有个人项目代号、隐含身份、编码秘密或自然语言隐私；必须逐文件语义
 审核并保持构建输入与私人数据隔离。通过门禁不代表“零风险”或 v1.0.0 正式发布就绪。
 
+## 标签与内部版本一致性（发布前必做，P0）
+
+- GitHub “Source code (zip)” 由 tag 指向的提交自动生成，不是 Release 附件；官方安装以
+  附件 zip 为准，但 tag 提交树必须与附件内容一致，否则会出现“发布页能下载到旧内容”的
+  假象（v0.21.0-beta.1 曾出现：附件已是 0.21.0-beta.1，tag 提交仍是 0.15.0-beta.1）。
+- 发布前对本机候选做只读远端核验：
+
+```text
+python -B scripts/release_update.py verify-remote-tag --tag <vX.Y.Z...>
+```
+
+  输出 TAG_MATCH 才允许基于该 tag 创建/确认 Release；TAG_MISMATCH 时停止，先在内容与
+  候选一致的提交上重建 tag（或把候选内容提交到分支后再打 tag），禁止只上传附件而忽略
+  tag 提交树。
+- 候选 CORE.json 的 version 必须与 tag 去掉前导 v 后的版本一致；plan-install
+  --expected-version 只保证“候选目录”的版本与计划一致，不能代替对远端 tag 提交树的核验。
+- 不要在任意旧提交上打新 tag 后仅上传本地 zip；两端内容一旦分叉，用户按 tag 下载的
+  源码包和附件会长期不一致，且难以事后追溯。
+- 跨版本升级遇到新增组件时，用 update-brief 所述 --reviewed-manifest 迁移审查收据精确
+  放行；该收据与发布内容审核不同，二者都不是发布授权。
+- 发布前必须在至少一台真实第二环境验证“旧基线（v0.15.0-beta.1）→ 候选版本”的受控
+  bootstrap（官方 zip + 候选包自带更新器 + reviewed-manifest，或用户明确拒绝时走核心
+  替换兜底），并把该流程写入 Release 说明；验收必须包含升级前后私人档案摘要不变、
+  记录/偏好可读与续写成功；未通过不发布。
+
 ## 跨平台与故障验收矩阵（本机已执行 / 仍待真实执行）
 
 代码只使用 Python 标准库与 pathlib；写锁在 Windows 用 msvcrt、其它平台用 fcntl，均为

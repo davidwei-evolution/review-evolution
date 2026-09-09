@@ -10,9 +10,9 @@ ROOT_FILES={'SKILL.md','README.md','CHANGELOG.md','.gitignore','CORE.json','LICE
 REFS={'workflow.md','record-schema.md','pack-format.md','install.md','installer-review-template.md',
       'preference-plan-a.md','task-start-checklist.md','release-check.md',
       'conversations/index.md','conversations/s2-hit-register.md','update-brief.md',
-      'client-acceptance.md'}
-SCRIPTS={'experience.py','preference_engine.py','safe_store.py','core_package.py','release_gate.py','release_update.py'}
-TESTS={'test_components.py','test_release_gate.py','test_release_update.py'}
+      'client-acceptance.md','compatibility-matrix.md','feedback-template.md'}
+SCRIPTS={'recall_view.py','diagnostics.py','profile_backup.py','experience.py','preference_engine.py','safe_store.py','core_package.py','release_gate.py','release_update.py','re-cli.ps1','verify-core.ps1'}
+TESTS={'test_s2_classification.py','test_recall_view.py','test_diagnostics.py','test_profile_backup.py','test_components.py','test_release_gate.py','test_release_update.py'}
 META_FIELDS={'version','release_series','data_schema','core_api','canonical_name','lineage_id','release_ready','files'}
 DEV_VERSION=re.compile(r'0\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-beta(?:\.(?:0|[1-9][0-9]*))?)?\Z')
 # Development core keeps the private identity; a content-bound public candidate may use

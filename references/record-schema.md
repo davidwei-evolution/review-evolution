@@ -1,5 +1,29 @@
 # 私人记录 Schema 1
 
+## S2 可选分类（v0.16.0-beta.1 起）
+
+分类字段须同时提供，且只用于 S2：
+
+- s2_type：runtime（运行工具）、reasoning（推理核验）、execution（执行交付）、interaction（用户互动）。
+- s2_applicability：current-user（本档案对应用户）、task-environment（特定任务/环境）、reusable-method（待结合现场复核的可复用方法）。
+- s2_context：非空字符串，说明具体适用条件、限制及用户互动背景；不以该字段替代原有 evidence/environment。
+
+interaction 必须为 current-user；“可复用”仍是私人方法，不代表公共许可或跨用户授权。
+字段全部缺省的旧记录保留原样，查询视图显示 unclassified，不自动补写或计分。
+
+query/recall 支持 --s2-type，指定后只查 S2；与 --component s1 同用报错。
+s2-classification-preview 只读列出有效/候选的未分类记录与证据（默认20条，可 --limit 1..100）。
+Agent 阅读后给出具体分类理由，用户确认前不修改旧记录。确认后以 add 新增带 supersedes 的修订：
+原 ID/证据/效果引用保留，新修订有新 ID；候选不能仅因为分类确认就升级为 confirmed。
+预览 plan_id 仅是预览内容摘要，不是自动迁移授权，也不是 add 的事务提交参数。
+
+含分类字段的导出包使用 core_api=2；新版本仍接受 API 1 旧包。旧核心因 API 2 明确拒绝导入。
+本地数据根 schema 仍为1；旧核心可能忽略新字段，因此写入分类后的档案不得直接降级给旧核心使用。
+导出包拒绝保护不等于全面降级防护；需要回退时使用对应旧核心与其原备份。完整备份仍遵守相同核心摘要恢复。
+
+S1 是用户偏好事实，S2 是 AI 有依据的改进方法，S3 是技能实现变更；仅 S1 偏好事件计分。
+本分类不是事实/经历/方法三类记忆的替代，而是 S2 内部按问题领域细分。
+
 S1 示例（所有值均为合成样例，使用时替换为真实依据）：
 
 ```json
@@ -19,6 +43,17 @@ confirmed 新修订表达。跨 component 的替代/停用一律拒绝。
 
 S2 另须 cause/prevention/counter_signal（字符串）和 environment（版本键值表；未知可为空但
 必须标明待验证）。跨客户端导入保留来源状态，回查明确提醒验证当前环境，不承诺错误不复发。
+
+S2 记录完整合成示例（所有值均为合成，使用时替换为真实依据；state 为 confirmed 时再补
+confirmed_by 原话或核验引用）：
+
+```json
+{"id":"22222222222222222222222222222222","component":"s2","module":"release","scope":"general","category":"upgrade","state":"candidate","text":"跨版本升级因未知新组件停止时，先完成可读迁移审查，再用 --reviewed-manifest 精确放行，不改动校验代码。","task_id":"example-task","created_at":"2026-01-01T00:00:00Z","evidence":["合成示例，不是真实观察"],"s2_type":"execution","s2_applicability":"task-environment","s2_context":"仅在候选来源经官方 digest 核验、审查覆盖全部新增文件时适用","environment":{"os":"Windows","platform":"QwenWork","python_version":"3.14.7"},"cause":"旧门禁白名单不含新组件且更新器无合规续行参数","prevention":"迁移审查后使用 --reviewed-manifest 提供逐文件哈希与依据","counter_signal":"候选来源未验签、审查遗漏新增文件或需删除旧文件时，停止并拒绝安装"}
+```
+
+说明：S2 在通用必填（id/component/module/scope/category/state/text/task_id/created_at/
+evidence）之外，另须 cause/prevention/counter_signal 字符串与 environment 版本键值表；
+s2_type/s2_applicability/s2_context 三者须同时出现，取值语义见本文件首节。
 query 对 S2 记录返回 `environment_review`：自动比对 environment 与本机标准离线键
 （os/platform/python_version），给出 mismatched_keys/unverifiable_keys；只对标准键自动判断，
 其他环境因素仍需人工核对。
@@ -76,3 +111,4 @@ recalled 需要 opportunity。未关联偏好可省略 preference_id，但 hit �
 在私人 profile 内实时生成只读视图；一致性审计用 `consistency-check`。只读导出/查询/审计
 不会晋级、不改变 revision。归属不清的 S1/S2 记录先写 module=uncategorized（category 可标
 “待归类”）+ state=candidate，归位用新的 confirmed 修订（supersedes 旧记录）留痕。
+v0.20.3：分类 candidate 仅在目标也是 candidate 且正文、证据、原因、预防、反例与环境均未变化时停用目标；允许更正场景分类。其它候选修订保留为候选，不隐藏原件、不自动确认。读取旧档案同样按此视图计算，不改原字节。部分导出补齐此类状态依赖并确认范围扩展。
