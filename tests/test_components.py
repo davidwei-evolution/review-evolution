@@ -7,8 +7,28 @@ import safe_store as st
 import core_package as cp
 import release_gate as gate
 
+def optional_s3_enabled():
+    """True in the development edition (S3 always on). The public base edition ships
+    without the optional S3 module, so those cases must skip rather than error."""
+    try:
+        import optional_features as features
+        return bool(features.status(e.CORE)['enabled'])
+    except (ValueError,OSError,KeyError,ImportError):
+        return False
+
 def test_review(root,path):
     receipt=gate.draft(root)
+    # 1.0 (2026-09-12): the shipped core is now a stable release, so the receipt must carry the
+    # stable_evidence block. The fixture fills it as synthetic evidence; the channel is not relaxed,
+    # so the satisfied 'stable-evidence-required' item is dropped from the pending review list.
+    if 'stable_evidence' in receipt:
+        receipt['stable_evidence'].update(
+            tests_evidence='Synthetic fixture reference (the real run is recorded in the release receipt)',
+            acceptance_evidence='Synthetic fixture reference; not publication approval',
+            frozen_core_sha256=st.digest((Path(root)/'CORE.json').read_bytes()),
+            confirmations=2)
+        receipt['findings_to_review']=[f for f in receipt['findings_to_review']
+                                       if f['rule']!='stable-evidence-required']
     # This fixture only acknowledges the literal synthetic Windows path in this test source.
     for f in receipt['findings_to_review']:
         if f['file']!='tests/test_components.py' or f['rule']!='absolute-windows-path':
@@ -43,6 +63,166 @@ def s1outcome(task_id='task-1',**kw):
     row.update(kw);return row
 
 class Components(unittest.TestCase):
+
+    def test_layout_rejects_oversized_manifest_before_read(self):
+        out=self.base/'oversized.zip'
+        with e.zipfile.ZipFile(out,'w',compression=e.zipfile.ZIP_DEFLATED) as archive:archive.writestr('pack.json',b'x'*101)
+        with patch.object(e,'MAX_FILE',100),patch.object(e.zipfile.ZipFile,'open',side_effect=AssertionError('Payload read')):
+            with self.assertRaises(ValueError):e.pack_layout(out)
+        directory=self.base/'large-directory';directory.mkdir();(directory/'pack.json').write_bytes(b'x'*101)
+        with patch.object(e,'MAX_FILE',100):
+            with self.assertRaises(ValueError):e.pack_layout(directory)
+
+    def test_layout_rejects_collisions_and_symlinks_without_extracting(self):
+        import warnings
+        for index,entries in enumerate((['pack.json','pack.json'],['pack.json','PACK.JSON'],['pack.json','../bad/'])):
+            out=self.base/('collision%d.zip'%index)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore',UserWarning)
+                with e.zipfile.ZipFile(out,'w') as archive:
+                    for name in entries:archive.writestr(name,'{}')
+            self.assertFalse(e.pack_layout(out)['ok'])
+        out=self.base/'link.zip';item=e.zipfile.ZipInfo('link');item.create_system=3;item.external_attr=0o120777<<16
+        with e.zipfile.ZipFile(out,'w') as archive:archive.writestr(item,'destination')
+        self.assertFalse(e.pack_layout(out)['ok']);self.assertFalse((self.base/'destination').exists())
+
+    def test_environment_cli_ignores_missing_binding_and_preserves_profile(self):
+        before=e.profile_digest(self.root,include_s3=True)
+        command=[sys.executable,'-B',str(e.CORE/'scripts/experience.py'),'--profile',str(self.base/'missing'),'environment']
+        result=subprocess.run(command,capture_output=True,encoding='utf-8',timeout=15)
+        self.assertEqual(result.returncode,0,result.stderr)
+        row=json.loads(result.stdout)
+        self.assertEqual(row['environment'],e.current_environment())
+        self.assertEqual(row['host'],'unknown');self.assertEqual(row['persistence'],'unknown')
+        self.assertTrue(row['read_only']);self.assertEqual(before,e.profile_digest(self.root,include_s3=True))
+
+    def test_divergent_branches_union_retry_and_same_id_conflict(self):
+        a=self.base/'branch-a';b=self.base/'branch-b';c=self.base/'merged'
+        for root in (a,b,c):e.init(root,self.meta['profile_id'])
+        common=record(text='Common');ra=record(text='A only');rb=record('s2',text='B only')
+        for root in (a,b,c):e.add(root,common)
+        e.add(a,ra);e.add(b,rb)
+        e.add(a,record(text='Extra A revision'))
+        pa=self.base/'pack-a';pb=self.base/'pack-b'
+        e.export_pack(a,pa,('s1','s2'));e.export_pack(b,pb,('s1','s2'))
+        for pack in (pa,pb):
+            plan=e.import_plan(c,pack)
+            self.assertFalse(plan['conflicts'])
+            e.import_pack(c,pack,plan['plan_id'])
+        ids={row['id'] for row in e.query(c)['records']}
+        self.assertTrue({common['id'],ra['id'],rb['id']}<=ids)
+        before=e.profile_digest(c,include_s3=True)
+        for pack in (pa,pb):
+            plan=e.import_plan(c,pack)
+            self.assertEqual(e.import_pack(c,pack,plan['plan_id'])['status'],'unchanged')
+        self.assertEqual(before,e.profile_digest(c,include_s3=True))
+        d=self.base/'conflicting';e.init(d,self.meta['profile_id']);e.add(d,dict(ra,text='Changed same ID'))
+        pd=self.base/'pack-conflict';e.export_pack(d,pd,('s1','s2'))
+        plan=e.import_plan(c,pd)
+        self.assertTrue(plan['conflicts'])
+        with self.assertRaises(ValueError):e.import_pack(c,pd,plan['plan_id'])
+        self.assertEqual(before,e.profile_digest(c,include_s3=True))
+
+    def test_misplaced_profile_cli_guidance_has_no_mutation(self):
+        before=e.profile_digest(self.root,include_s3=True)
+        command=[sys.executable,'-B',str(e.CORE/'scripts/experience.py')]
+        for tail in (['status','--profile',str(self.root)],['status','--profile='+str(self.root)]):
+            result=subprocess.run(command+tail,capture_output=True,encoding='utf-8',timeout=15)
+            self.assertEqual(result.returncode,2)
+            self.assertIn('全局参数',result.stderr)
+        good=subprocess.run(command+['--profile',str(self.root),'status'],capture_output=True,encoding='utf-8',timeout=15)
+        self.assertEqual(good.returncode,0,good.stderr)
+        bad=subprocess.run(command+['status','--unknown'],capture_output=True,encoding='utf-8',timeout=15)
+        self.assertEqual(bad.returncode,2);self.assertNotIn('全局参数',bad.stderr)
+        self.assertEqual(before,e.profile_digest(self.root,include_s3=True))
+
+    def test_s3_receipt_time_is_not_event_time_and_retry_is_unchanged(self):
+        row={'task_id':'receipt-time','text':'Synthetic','evidence':'Synthetic evidence'}
+        with patch.object(e,'now',return_value='2026-09-10T01:00:00Z'):
+            first=e.log_s3(self.root,row,True)
+        before=e.profile_digest(self.root,include_s3=True)
+        with patch.object(e,'now',return_value='2026-09-11T01:00:00Z'):
+            self.assertEqual(e.log_s3(self.root,row,True)['status'],'unchanged')
+        stored=e.query_s3(self.root)['records'][0]
+        self.assertEqual(stored['recorded_at'],first['recorded_at']);self.assertNotIn('created_at',stored)
+        self.assertEqual(before,e.profile_digest(self.root,include_s3=True))
+
+    def test_s3_receipt_retry_preserves_legacy_and_distinct_milestones(self):
+        row={'task_id':'legacy','text':'Before','evidence':'Synthetic evidence'}
+        e.log_s3(self.root,row);before=e.profile_digest(self.root,include_s3=True)
+        self.assertEqual(e.log_s3(self.root,row,True)['status'],'unchanged')
+        self.assertEqual(before,e.profile_digest(self.root,include_s3=True))
+        e.log_s3(self.root,dict(row,text='After'),True)
+        self.assertEqual(len(e.query_s3(self.root)['records']),2)
+        with self.assertRaises(ValueError):e.log_s3(self.root,dict(row,recorded_at='invented'),True)
+
+    def test_observation_retry_preserves_revision_and_scores(self):
+        row={k:v for k,v in record().items() if k not in ('id','state','created_at')}
+        first=e.add_observation(self.root,row);before=e.profile_digest(self.root)
+        with patch.object(e,'now',return_value='2030-01-01T00:00:00Z'):
+            second=e.add_observation(self.root,row)
+        self.assertEqual(first['record_id'],second['record_id'])
+        self.assertEqual(second['status'],'unchanged');self.assertFalse(second['scored'])
+        self.assertEqual(e.profile_digest(self.root),before)
+        self.assertEqual(e.query(self.root,task_id=row['task_id'])['records'][0]['state'],'candidate')
+
+    def test_observation_rejects_confirmation_and_incomplete_s2(self):
+        row={k:v for k,v in record().items() if k not in ('id','state','created_at')}
+        for key,value in (('state','confirmed'),('confirmed_by','yes'),('score',10),('id','a'*32)):
+            with self.assertRaises(ValueError):e.add_observation(self.root,dict(row,**{key:value}))
+        with self.assertRaises(ValueError):e.add_observation(self.root,dict(row,component='s2'))
+        with self.assertRaises(ValueError):e.add_observation(self.root,dict(row,evidence=[]))
+
+    def test_observation_s2_keeps_environment_and_new_evidence_distinct(self):
+        row={k:v for k,v in record('s2').items() if k not in ('id','state','created_at')}
+        row['environment']={'os':'posix','platform':'linux'}
+        a=e.add_observation(self.root,row)
+        b=e.add_observation(self.root,dict(row,evidence=['Different real evidence placeholder']))
+        self.assertNotEqual(a['record_id'],b['record_id'])
+        self.assertTrue(all(r['environment']==row['environment'] for r in e.query(self.root,component='s2')['records']))
+
+    def test_s3_context_old_unknown_and_filter(self):
+        row=dict(task_id='old',text='old entry',evidence='synthetic')
+        e.log_s3(self.root,row)
+        new=dict(row,task_id='mobile',context={'terminal':'mobile','runtime':'hosted','applicability':'environment','verification':'source-reported'})
+        e.log_s3(self.root,new)
+        self.assertEqual(len(e.query_s3(self.root,terminal='unknown')['records']),1)
+        self.assertEqual(e.query_s3(self.root,terminal='mobile')['records'],[new])
+        with self.assertRaises(ValueError):e.log_s3(self.root,dict(row,context={'terminal':'invented'}))
+
+    def test_s3_roundtrip_explicit_separate_and_idempotent(self):
+        row=dict(task_id='s3',text='synthetic',evidence='test',context={'terminal':'mobile'})
+        e.log_s3(self.root,row)
+        regular=self.pack()
+        self.assertFalse(any('s3' in p.as_posix() for p in regular.rglob('*')))
+        plan=e.s3_export_plan(self.root);pack=self.base/'s3-pack'
+        e.export_s3(self.root,pack,plan['plan_id'])
+        with self.assertRaises(ValueError):e.validate_pack(pack)
+        target=self.base/'different';e.init(target)
+        with self.assertRaises(ValueError):e.s3_import_plan(target,pack)
+        p=e.s3_import_plan(target,pack,True)
+        with self.assertRaises(ValueError):e.import_s3(target,pack,p['plan_id'],True)
+        result=e.import_s3(target,pack,p['plan_id'],True,'synthetic authorization')
+        self.assertEqual(result['added'],1)
+        self.assertEqual(e.query_s3(target,task_id='s3')['records'],[row])
+        before=e.profile_digest(target,include_s3=True)
+        p=e.s3_import_plan(target,pack,True)
+        self.assertEqual(e.import_s3(target,pack,p['plan_id'],True,'synthetic')['status'],'unchanged')
+        self.assertEqual(before,e.profile_digest(target,include_s3=True))
+
+    def test_s3_tamper_stale_and_atomic_failure(self):
+        e.log_s3(self.root,dict(task_id='one',text='one',evidence='test'))
+        plan=e.s3_export_plan(self.root);pack=self.base/'s3-pack'
+        e.export_s3(self.root,pack,plan['plan_id'])
+        target=self.target();p=e.s3_import_plan(target,pack)
+        before=e.profile_digest(target,include_s3=True)
+        with patch.object(st,'apply',side_effect=OSError('synthetic write failure')):
+            with self.assertRaises(OSError):e.import_s3(target,pack,p['plan_id'])
+        self.assertEqual(before,e.profile_digest(target,include_s3=True))
+        e.log_s3(target,dict(task_id='two',text='two',evidence='test'))
+        with self.assertRaises(ValueError):e.import_s3(target,pack,p['plan_id'])
+        f=next(x for x in pack.glob('*.json') if x.name!='pack.json');f.write_text('{}')
+        with self.assertRaises(ValueError):e.validate_s3_pack(pack)
 
     def test_query_capture_avoids_record_reparse_read(self):
         row=record(state='confirmed',confirmed_by='synthetic confirmation');e.add(self.root,row)
@@ -82,7 +262,13 @@ class Components(unittest.TestCase):
     def test_intro_verified_version_and_current_capabilities(self):
         value=e.introduction()
         self.assertEqual(value['version'],cp.verify(e.CORE)['version'])
-        self.assertEqual({c['id'] for c in value['capabilities']},{'recall','personal-experience','error-review','skill-review','migration','outcomes','updates','backup','diagnostics'})
+        base={'recall','personal-experience','error-review','migration','updates','backup','diagnostics'}
+        dev_only={'skill-review','outcomes'}   # tied to the development edition's extra surfaces
+        ids={c['id'] for c in value['capabilities']}
+        self.assertTrue(base<=ids,'core capabilities must always be present')
+        self.assertTrue(ids<=(base|dev_only),'unexpected capability card')
+        if optional_s3_enabled():
+            self.assertEqual(ids,base|dev_only)
         self.assertIn(value['profile_state'],('bound-valid','needs-setup-or-repair','not-inspected'))
         for card in value['capabilities']:
             self.assertTrue(card['ability'] and card['example'] and card['advice'])
@@ -135,13 +321,17 @@ class Components(unittest.TestCase):
         cli=(e.CORE/'scripts/re-cli.ps1').read_text(encoding='utf-8')
         self.assertIn('Test-PythonVersionText',cli)
 
+    def test_binding_stat_permission_denied_is_not_inspected(self):
+        with patch.object(Path,'is_file',side_effect=PermissionError('synthetic denied')):
+            self.assertEqual(e.default_binding_state(),'not-inspected')
+
     def test_compat_and_feedback_docs_bound_to_manifest_and_gate(self):
         meta=e.read(e.CORE/'CORE.json')
         for rel in ('references/compatibility-matrix.md','references/feedback-template.md'):
             self.assertIn(rel,meta['files'])
             self.assertTrue(gate.permitted(rel))
         matrix=(e.CORE/'references/compatibility-matrix.md').read_text(encoding='utf-8')
-        self.assertIn('最低起点 v0.15.0-beta.1',matrix)
+        self.assertIn('最低起点 v0.21.5-beta.1',matrix)
         self.assertIn('core_api=2',matrix)
         template=(e.CORE/'references/feedback-template.md').read_text(encoding='utf-8')
         self.assertIn('unknown',template)
@@ -223,6 +413,8 @@ class Components(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
         self.root=self.base/'source';self.meta=e.init(self.root)
+        binding_patch=patch.object(e,'binding_path',return_value=self.base/'installation.json')
+        binding_patch.start();self.addCleanup(binding_patch.stop)
     def tearDown(self):self.tmp.cleanup()
     def target(self):
         root=self.base/uuid.uuid4().hex;e.init(root,self.meta['profile_id']);return root
@@ -243,6 +435,38 @@ class Components(unittest.TestCase):
         st.atomic_bytes(self.root/'legacy/private.md',b'PRIVATE');st.atomic_bytes(self.root/'s3-private/private.json',b'{}')
         man,rows=e.validate_pack(self.pack(('s2',)))
         self.assertEqual(len(rows),1);self.assertTrue(all(rel.startswith('s2/') for rel in rows))
+    def test_export_zip_single_layer_and_directory_name_guard(self):
+        import zipfile as zf
+        e.add(self.root,record());e.add(self.root,record('s2'))
+        fake=self.base/'fake.zip'
+        with self.assertRaises(ValueError):e.export_pack(self.root,fake,('s1','s2'))
+        out=self.base/'pack.zip'
+        result=e.export_pack(self.root,out,('s1','s2'),as_zip=True)
+        self.assertEqual(result['path_type'],'zip')
+        layout=e.pack_layout(out)
+        self.assertTrue(layout['single_layer']);self.assertEqual(layout['pack_kind'],'private-experience')
+        unpack=self.base/'unpacked';unpack.mkdir()
+        with zf.ZipFile(out) as z:z.extractall(unpack)
+        self.assertEqual(len(e.validate_pack(unpack)[1]),2)
+        bad=self.base/'bad.zip'
+        with zf.ZipFile(bad,'w') as z:z.writestr('../escape.txt','x')
+        bad_layout=e.pack_layout(bad)
+        self.assertFalse(bad_layout['ok']);self.assertIn('../escape.txt',bad_layout['forbidden_entries'])
+    def test_export_s3_zip_single_layer(self):
+        import zipfile as zf
+        e.log_s3(self.root,{'task_id':'s3zip','text':'synthetic','evidence':'test'})
+        plan=e.s3_export_plan(self.root)
+        fake=self.base/'fake-s3.zip'
+        with self.assertRaises(ValueError):e.export_s3(self.root,fake,plan['plan_id'])
+        out=self.base/'s3-pack.zip'
+        result=e.export_s3(self.root,out,plan['plan_id'],as_zip=True)
+        self.assertEqual(result['path_type'],'zip')
+        layout=e.pack_layout(out)
+        self.assertTrue(layout['single_layer']);self.assertEqual(layout['pack_kind'],'private-s3')
+        unpack=self.base/'s3-unpacked';unpack.mkdir()
+        with zf.ZipFile(out) as z:z.extractall(unpack)
+        man,_=e.validate_s3_pack(unpack)
+        self.assertEqual(man['kind'],'private-s3')
     def test_partial_export_keeps_state_and_requires_preview(self):
         a=record(scope='personal');e.add(self.root,a)
         b=record(scope='work',supersedes=a['id'],state='confirmed',confirmed_by='synthetic yes')
@@ -652,17 +876,53 @@ class Components(unittest.TestCase):
         with self.assertRaises(ValueError):
             e.scene_census(self.root,threshold=1)
     def test_update_ledger_schema2_brief_and_status(self):
-        e.mark_updates(self.root,{'channel':'ecosystem','checked_at':'2026-09-06T02:00:00Z',
-                                  'summary':'two candidate skills found','new_items':2,
-                                  'brief':{'summary':'two candidates','items':[]}})
-        ledger=e.load_update_ledger(self.root)
-        self.assertEqual(ledger['schema'],2)
-        self.assertEqual(ledger['ecosystem']['new_items'],2)
-        self.assertEqual(ledger['ecosystem']['last_brief'],{'summary':'two candidates','items':[]})
+        legacy=e.default_update_ledger()
+        legacy['ecosystem']={'new_items':2,'last_brief':{'summary':'old history'}}
+        path=self.root/e.UPDATE_REL;path.write_bytes(e.encoded(legacy))
+        before=path.read_bytes()
+        self.assertNotIn('ecosystem',e.updates_status(self.root))
+        self.assertEqual(set(e.updates_check_dry_run(self.root)['channels']),{'repo'})
+        self.assertEqual(path.read_bytes(),before)
+        with self.assertRaises(ValueError):
+            e.mark_updates(self.root,{'channel':'ecosystem','checked_at':'2026-09-06T02:00:00Z','summary':'retired'})
+        self.assertEqual(path.read_bytes(),before)
         e.mark_updates(self.root,{'channel':'repo','checked_at':'2026-09-06T03:00:00Z',
                                   'summary':'no published release','latest_version':'0.9.8'})
         status=e.updates_status(self.root)
         self.assertEqual(status['repo']['latest_version'],'0.9.8')
+        self.assertEqual(e.load_update_ledger(self.root)['ecosystem'],legacy['ecosystem'])
+        self.assertNotIn('ecosystem',e.default_update_ledger())
+    def test_update_ledger_state_timezone_and_installed_version(self):
+        e.mark_updates(self.root,{'channel':'repo','checked_at':'2026-09-06T00:00:00Z',
+                                  'summary':'network failure','state':'failed'})
+        status=e.updates_status(self.root)
+        self.assertEqual(status['repo']['last_state'],'failed')
+        self.assertTrue(status['repo']['due'])
+        with self.assertRaises(ValueError):
+            e.mark_updates(self.root,{'channel':'repo','checked_at':'2026-09-06T00:00:00',
+                                      'summary':'naive timestamp'})
+        with self.assertRaises(ValueError):
+            e.mark_updates(self.root,{'channel':'repo','checked_at':'2026-09-06T00:00:00Z',
+                                      'summary':'skip with version','state':'skipped',
+                                      'latest_version':'0.9.9'})
+        e.mark_updates(self.root,{'channel':'repo','checked_at':'2026-09-06T04:00:00Z',
+                                  'summary':'installed current','installed_version':'0.21.5-beta.1',
+                                  'latest_version':'v0.21.5-beta.1'})
+        status=e.updates_status(self.root)
+        self.assertTrue(status['repo']['up_to_date'])
+        self.assertFalse(status['repo']['due'])
+    def test_update_ledger_naive_legacy_timestamp_does_not_crash(self):
+        path=self.root/'updates/ledger.json'
+        row={'schema':2,'reminders_enabled':True,'min_interval_days':21,
+             'repo':{'url':'x','status':'repo_ready','published_version':None,
+                     'installed_version':None,'latest_version':None,
+                     'last_checked_at':'2026-09-06T00:00:00','last_state':None,
+                     'last_result':'legacy','last_brief':None},
+             'ecosystem':{'last_checked_at':None,'last_state':None,'last_result':None,
+                          'last_brief':None,'new_items':0}}
+        path.write_bytes(e.encoded(row))
+        status=e.updates_status(self.root)
+        self.assertIn('due',status['repo'])
     def test_updates_check_dry_run_is_local_skeleton_without_network(self):
         brief=e.updates_check_dry_run(self.root)
         self.assertTrue(brief['dry_run'])
@@ -700,6 +960,34 @@ class Components(unittest.TestCase):
             second = self.target()
             self.assertEqual(e.bind(second, force=True)['status'], 'bound')
             self.assertEqual(e.profile_root(None), second)
+    def test_context_binding_separates_accounts_and_keeps_legacy_default(self):
+        env={'LOCALAPPDATA':str(self.base/'appdata-ctx'),
+             'REVIEW_EVOLUTION_CLIENT':'qwen','REVIEW_EVOLUTION_ACCOUNT':'alice'}
+        with patch.dict(os.environ,env):
+            with self.assertRaises(ValueError) as ctx:
+                e.profile_root(None)
+            self.assertIn('No context binding',str(ctx.exception))
+            self.assertEqual(e.bind_context(self.root,'qwen','alice',person_id='person-a')['status'],
+                             'bound-context')
+            self.assertEqual(e.profile_root(None),self.root)
+            second=self.target()
+            self.assertEqual(e.bind_context(second,'qwen','bob')['status'],'bound-context')
+            with patch.dict(os.environ,{'REVIEW_EVOLUTION_ACCOUNT':'bob'}):
+                self.assertEqual(e.profile_root(None),second)
+            view=e.context_view()
+            self.assertEqual(view['active'],{'client':'qwen','account':'alice'})
+            self.assertEqual(len(view['entries']),2)
+            third=self.target()
+            with self.assertRaises(ValueError):
+                e.bind_context(third,'qwen','bob')
+            self.assertEqual(e.bind_context(third,'qwen','bob',force=True)['status'],'bound-context')
+            with patch.dict(os.environ,{'REVIEW_EVOLUTION_ACCOUNT':'bob'}):
+                self.assertEqual(e.profile_root(None),third)
+        with patch.dict(os.environ,{'LOCALAPPDATA':str(self.base/'appdata-ctx'),
+                                    'REVIEW_EVOLUTION_CLIENT':'qwen',
+                                    'REVIEW_EVOLUTION_ACCOUNT':''}):
+            with self.assertRaises(ValueError):
+                e.active_context()
     def test_read_payload_stdin_and_file(self):
         row = record()
         with patch('sys.stdin', io.StringIO(json.dumps(row))):
@@ -725,7 +1013,10 @@ class Components(unittest.TestCase):
         hits = e.query(self.root, text='结论 过程')['records']
         self.assertTrue(any(r['id'] == first['id'] for r in hits))
         strict = e.query(self.root, text='文档时先给目录')['records']
-        self.assertFalse(any(r['id'] == near['id'] for r in strict))
+        # 严格词面（整串逐字出现）没有命中；自 v0.22.3 起会先做一次重叠匹配兜底，
+        # 因此近似条目会被返回，但必须整体标注为 relaxed（见 test_recall_relaxed.py）。
+        self.assertIn('text_match',e.query(self.root, text='文档时先给目录'))
+        self.assertTrue(any(r['id'] == near['id'] for r in strict))
         fuzzy = e.query(self.root, text='文档时先给目录', fuzzy=True)['records']
         near_view = [r for r in fuzzy if r['id'] == near['id']]
         self.assertTrue(near_view)
@@ -877,5 +1168,19 @@ class Components(unittest.TestCase):
         e.add_event(target,event(source='decision',kind='decision',target=diff,basis=basis,choice='weaken',penalty=2))
         rows=e.load_rows(target);snap=e.pe.snapshot({Path(k).stem:r for k,r in rows.items()})
         self.assertEqual(snap['preferences'][0]['score'],6)
+
+# 027: the public base edition ships without the optional S3 module. Those cases depend on the
+# environment, not on the code being wrong, so they skip here instead of failing the build.
+if not optional_s3_enabled():
+    for _name in ('test_auxiliary_capacity_rejection_is_readable','test_export_s3_zip_single_layer',
+                  'test_read_paths_never_open_writer_lock','test_s1_legacy_scores_unchanged_by_s2_and_s3',
+                  'test_s3_context_old_unknown_and_filter','test_s3_not_in_export',
+                  'test_s3_query_refuses_external_changes_without_revision',
+                  'test_s3_receipt_retry_preserves_legacy_and_distinct_milestones',
+                  'test_s3_receipt_time_is_not_event_time_and_retry_is_unchanged',
+                  'test_s3_roundtrip_explicit_separate_and_idempotent','test_s3_status_fields_and_filter',
+                  'test_s3_tamper_stale_and_atomic_failure'):
+        setattr(Components,_name,
+                (lambda self,_n=_name:self.skipTest('optional S3 module not installed in this edition')))
 
 if __name__=='__main__':unittest.main()

@@ -13,6 +13,12 @@ VERSION = 'plan-a-v1'
 EVENTS = Path('preferences/events')
 SCOPES = ('work', 'personal', 'general')
 KINDS = ('support', 'explicit', 'difference', 'exception', 'replace', 'decision', 'classify', 'promote')
+# Fields that belong to the event schema. Anything else is dropped on write so the
+# ledger never gains shapes that readers do not expect (see KNOWN_ISSUES D1).
+EVENT_FIELDS = ('policy', 'preference_id', 'scope', 'module', 'text', 'source', 'evidence',
+                'device', 'date', 'kind', 'confirmed_by', 'category', 'topic',
+                'classification_state', 'choice', 'target', 'basis', 'penalty',
+                'scope_target', 'category_target', 'task_id')
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -79,8 +85,22 @@ def event_id(e):
     # Device and local timestamp do not distinguish duplicate observations.
     return digest([e['source'], e['preference_id'], e['scope'], e['kind']])
 
+def normalize(e):
+    """Return (clean_event, dropped_field_names).
+
+    Redundant fields written by older callers (for example a stray ``component``)
+    are dropped instead of stored, so readers can rely on the schema. Validation
+    still runs first, so a genuinely wrong ``component`` value is still rejected
+    rather than silently discarded.
+    """
+    if not isinstance(e, dict):
+        return e, []
+    dropped = sorted(k for k in e if k not in EVENT_FIELDS)
+    return {k: v for k, v in e.items() if k in EVENT_FIELDS}, dropped
+
 def canonical(e):
-    return {k: v for k, v in e.items() if k not in ('device', 'date')}
+    clean, _ = normalize(e)
+    return {k: v for k, v in clean.items() if k not in ('device', 'date')}
 
 def load(root):
     events = {}
@@ -120,6 +140,7 @@ def effective_preferences(snap):
 
 def add_event(root, e):
     validate(e)
+    e, _ = normalize(e)
     with safe_store.locked(root):
         existing = load(root)
         key = event_id(e)

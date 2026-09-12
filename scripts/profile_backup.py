@@ -40,7 +40,7 @@ def directories(root):
 
 def checked_profile(root):
     e.info(root);e.query(root)
-    e.query_s3(root);e.s1_metrics(root);e.s2_metrics(root)
+    e._query_s3(root);e.s1_metrics(root);e.s2_metrics(root)
     e.load_update_ledger(root);e.trusted_sources_view(root)
 
 
@@ -61,7 +61,9 @@ def separate_new_target(source,target):
     source=st.no_links(source).resolve();target=e.profile_root(target)
     if source.is_relative_to(target) or target.is_relative_to(source):
         raise ValueError('Use a separate output directory')
-    if target.exists():raise ValueError('Output must not exist; never overwrite a profile')
+    if target.exists():raise ValueError(
+        'Output must not exist; never overwrite a profile. '
+        '请换一个带时间戳的新目录名重试（例如 profile-backup-<YYYYMMDD>-<HHMM>），不要复用旧目录。')
     return target
 
 

@@ -9,6 +9,7 @@ python -B scripts/core_package.py verify
 python -B scripts/release_gate.py scan
 python -B scripts/release_gate.py draft
 python -B scripts/release_gate.py check --review <核心外审核记录.json>
+python -B scripts/check_windows_launchers.py <发布材料目录或zip>
 python -B scripts/core_package.py export --output <全新目录> --review <核心外审核记录.json>
 ```
 
@@ -31,11 +32,75 @@ CORE.json 仅允许核心版本、系列、API/schema、产品身份、开发状
 
 身份允许清单：开发版 (canonical_name=wb-review-evolution, lineage=wb-review-evolution)；
 公开发布候选 (canonical_name=review-evolution, lineage=wb-review-evolution) 可进入内容审核。
-两种身份下 publication_authorized 恒为 false；v1.0.0 / release_ready=true 仍不由本开发
-门禁放行，正式发布需另行确认的发布策略与完整审核。
+**版本通道（2026-09-12 起，1.0-A）**：门禁分两条通道，且 `release_ready` 必须与通道一致——
+
+- **开发/beta**：`0.x.y` 或 `0.x.y-beta[.n]`，**要求 `release_ready=false`**（写 true 直接拒绝）；
+- **stable**：`X.Y.Z`（X≥1，**无预发布后缀**），**要求 `release_ready=true`**，并且审核收据里必须有
+  `stable_evidence` 块：`tests_evidence`、`acceptance_evidence`（非空引用）、
+  `frozen_core_sha256`（**必须与本包 CORE.json 摘要一致**，可机检）、`confirmations`（**必须恰好为 2**，
+  对应用户两次确认）。缺任一项即拒绝；只跑 `scan` 永远不等于 stable 授权（会报 `stable-evidence-required`）。
+- 两种身份下 `publication_authorized` 恒为 false；**门禁通过只说明内容与证据齐备，正式发布仍是独立的人工授权动作**。
+- `draft` 在 stable 版本上会直接给出 `stable_evidence` 空骨架，避免漏填。
 
 扫描不能可靠理解所有个人项目代号、隐含身份、编码秘密或自然语言隐私；必须逐文件语义
 审核并保持构建输入与私人数据隔离。通过门禁不代表“零风险”或 v1.0.0 正式发布就绪。
+
+## 稳定门禁（B1；**2026-09-12 起已实现**，1.0-A）
+
+- **beta**：测试全绿 + 内容门禁 + 合成升级/失败回滚 + 支持范围三层口径公开 + TAG_MATCH +
+  两次人工确认；
+- **stable（1.0）**：在 beta 条件之上，必须具备① 真实第二环境的完整旅程（公开 Release 附件
+  首次安装 → 升级 → 失败恢复；可用“候选副本 + 合成档案”自动验收 harness 回传报告）、
+  ② ≥5 个真实 task_id 的效果样本、③ 支持范围冻结；并在审核收据的 `stable_evidence` 中写明
+  测试证据、验收证据、冻结摘要与两次确认。缺任一项由 `release_gate.check` 直接拒绝。
+  **未达成时不得出 stable**：受支持范围只能写“受限范围候选”，不写“完整支持”。
+
+## 一键运行交付物固定检查（.bat/.cmd，2026-09-10 起必做，beta/stable 均适用）
+
+背景：v0.21.21 第二环境验收包在真实机器上“双击后窗口闪退且无结果”，根因是包内
+`.bat` 只有裸 LF 行尾，并存在 `where python` 命中 Microsoft Store 占位程序的误判。
+该缺陷在本地自测中不可见，只在真实第二环境暴露。
+
+因此任何分发给用户、需要“双击/一键运行”的 Windows 交付物（安装包、验收包、
+自检包等）在发布前必须同时通过**静态检查**与**真实运行**两道：
+
+- 静态检查（可自动执行，只读、不运行目标文件）：
+
+```text
+python -B scripts/check_windows_launchers.py <发布材料目录或zip>
+```
+
+  必须输出 `"status": "PASS"`。它逐文件强制：
+  ① 行尾为 CRLF、不得只有裸 LF；② 不得带 UTF-8 BOM；③ 必须以换行结尾、可 UTF-8 解码；
+  ④ 必须存在 `pause`，且每个 `exit`/`exit /b` 之前在同一分支内有 `pause`；
+  ⑤ 必须存在把结果或日志落到文件的输出重定向（例如 `> "%LOG%"`、`>> 验收结果-*.md`）。
+  静态检查不能证明“真机可用”，只是把已知会让窗口闪退、无产出、乱码的形态挡在发布前。
+- 真实运行（人工/第二环境，无法用静态检查替代）：至少在一台真实机器上按用户实际用法
+  （双击，或把文件夹交给本机 AI 运行）跑一次，确认**看得见过程、有结果文件产出**；
+  两个路径至少要有一个可用，并在使用说明中写明。
+
+脚本只检查 `.bat`/`.cmd` 的形态，不判断业务是否正确；`PASS` 不等于真实可用，
+也不等于可以发布。修改任何被检查文件后必须重跑。
+
+## 已知问题与经验闭环检查（E3，发布前必做）
+
+发版前必须跑一次离线盘点，把"记录里的缺陷"和"发版决策"对上：
+
+```text
+python -B scripts/experience.py release-review
+```
+
+它只读列出 S3 里含缺陷类关键词（缺陷/崩溃/报错/异常/失败/bug/error/crash/regression）的条目，
+并给出 `defect_like` / `not_in_core` 计数。要求：
+
+- 每条缺陷类 S3 条目都要有结论——**对上 `KNOWN_ISSUES.md` 的 fixed，或在迭代计划里显式挂起并写明
+  理由**；已修的要能被回归测试或验收证据支持，挂起的要写明为什么现在不做；
+- 结论逐条写进 release note（"本版修复 / 挂起+理由"），不能只写"已处理"；
+- `release-review` 的关键词命中只是线索，可能包含正常提及故障的记录，必须复核后再下结论；
+  它是只读盘点，不修改任何 S3 记录，也不是发布授权。
+
+配套地：核心文件改动后先 `python -B scripts/core_package.py reseal` 再跑测试（见
+[使用与维护](workflow.md) 的"开发循环"）；`Core content mismatch` 表示没 reseal，不是代码坏了。
 
 ## 标签与内部版本一致性（发布前必做，P0）
 
@@ -57,10 +122,8 @@ python -B scripts/release_update.py verify-remote-tag --tag <vX.Y.Z...>
   源码包和附件会长期不一致，且难以事后追溯。
 - 跨版本升级遇到新增组件时，用 update-brief 所述 --reviewed-manifest 迁移审查收据精确
   放行；该收据与发布内容审核不同，二者都不是发布授权。
-- 发布前必须在至少一台真实第二环境验证“旧基线（v0.15.0-beta.1）→ 候选版本”的受控
-  bootstrap（官方 zip + 候选包自带更新器 + reviewed-manifest，或用户明确拒绝时走核心
-  替换兜底），并把该流程写入 Release 说明；验收必须包含升级前后私人档案摘要不变、
-  记录/偏好可读与续写成功；未通过不发布。
+- 发布前必须在至少一台真实第二环境验证“v0.21.5-beta.1 → 候选版本”的常规可信更新器升级；使用正式候选附件，包含档案基线比对和续写读回，未通过不发布。历史v0.15成功证据不替代新基线验收。
+- 在实际待发布内容的公开身份目录执行全量测试，夹具自行构造身份，不允许修改临时副本身份来豁免失败。检查SKILL标题、README版本行与CORE版本一致；发布状态不得从本地release_ready反推。
 
 ## 跨平台与故障验收矩阵（本机已执行 / 仍待真实执行）
 
@@ -81,3 +144,18 @@ python -B scripts/release_update.py verify-remote-tag --tag <vX.Y.Z...>
 - 不同客户端/跨主机同时对同一 profile 写锁竞争（同机双进程锁竞争已有回归测试）；
 - 第二台客户端/其它客户端的真实安装、导入与跨端查证；
 - 新核心与旧 v4.x 存档并存的迁移演练。
+
+## 发布材料的来源可核验（U3，2026-09-12）
+
+真机离线安装反馈：只靠包内自洽**证明不了来源**——包内 `CORE.json` 与文件逐一相符，只能说明
+"这包没被改坏"，不能说明"它来自作者仓库"。因此发布材料**固定附 `SHA256SUMS`**（至少列出 zip
+本体摘要，可含逐文件摘要），并允许随附发布 tag 的提交摘要。核验口径：
+
+| 场景 | 能证明什么 | 不能证明什么 |
+|---|---|---|
+| 记下 zip 的 SHA-256 并与发布页/`SHA256SUMS` 对照 | **来源与发布内容一致**（前提是发布页本身可信） | 包内容是否"绝对安全" |
+| 只有包内自洽（`core_package verify`） | 包没被改坏、清单与文件相符 | **来源**（谁产出的） |
+| 随包隐私审查收据（`purpose=privacy-review-not-publication-authorization`） | 做过内容审核 | 来源真实性、发布授权 |
+
+**离线安装的最低要求**：把 zip 的 SHA-256 记进验收报告；作者复核时与发布材料里的 `SHA256SUMS`
+比对。未做这一步时，报告必须如实写"来源未核验"，不得写成"已核验通过"。

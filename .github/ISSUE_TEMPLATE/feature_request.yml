@@ -1,0 +1,54 @@
+name: 功能建议
+description: 希望这个技能增加或改进什么
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        谢谢你的建议。说得越具体，越容易判断能不能做、怎么做。
+        **注意：请不要粘贴你的私人经验内容或真实对话原文。**
+
+  - type: textarea
+    id: need
+    attributes:
+      label: 你想解决什么问题
+      description: 用你自己的话描述场景即可，不需要技术术语
+      placeholder: 我在……的时候，希望能……
+    validations:
+      required: true
+
+  - type: textarea
+    id: now
+    attributes:
+      label: 现在你是怎么处理的
+      description: 目前的替代办法，或者目前为什么做不到
+    validations:
+      required: false
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你期望的做法（可选）
+      description: 如果你心里已经有想法，写在这里
+    validations:
+      required: false
+
+  - type: dropdown
+    id: importance
+    attributes:
+      label: 对你的重要程度
+      options:
+        - 影响我正常使用（必须修）
+        - 明显影响体验（希望尽快）
+        - 有了更好（不急）
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已确认以上内容不含我的私人经验、真实对话原文、账号或本机完整路径
+          required: true

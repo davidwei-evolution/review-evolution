@@ -198,7 +198,10 @@ class Installation(unittest.TestCase):
     def clone(self,path,v):
         meta,payload=u.core_bytes(u.CORE)
         for rel,data in payload.items():st.atomic_bytes(st.inside(path,rel),data)
-        meta['version']=v;st.atomic_bytes(path/'CORE.json',st.json_bytes(meta))
+        # Synthetic 0.x fixtures must stay development cores; the shipped core is a stable
+        # release since 1.0 (2026-09-12), so copy its release_ready would break the dev-gate cases.
+        meta['version']=v;meta['release_ready']=not v.startswith('0.')
+        st.atomic_bytes(path/'CORE.json',st.json_bytes(meta))
     def add_file(self,root,rel,data):
         meta=u.parse_json((root/'CORE.json').read_bytes())
         path=root/rel;path.parent.mkdir(parents=True,exist_ok=True)
@@ -220,6 +223,9 @@ class Installation(unittest.TestCase):
         st.atomic_bytes(self.candidate/'CORE.json',st.json_bytes(meta))
         with self.assertRaises(ValueError):self.plan()
     def test_allowed_canonical_identity_change_plans_with_audit_field(self):
+        target_meta=u.parse_json((self.target/'CORE.json').read_bytes())
+        target_meta['canonical_name']='wb-review-evolution'
+        st.atomic_bytes(self.target/'CORE.json',st.json_bytes(target_meta))
         meta=u.parse_json((self.candidate/'CORE.json').read_bytes())
         meta['canonical_name']='review-evolution'
         st.atomic_bytes(self.candidate/'CORE.json',st.json_bytes(meta))

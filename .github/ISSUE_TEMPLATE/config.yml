@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 安全问题（请私下反馈）
+    url: https://github.com/davidwei-evolution/review-evolution/security/advisories/new
+    about: 涉及私人经验数据泄露、被他人读取或安装包完整性时，请不要发公开 Issue。

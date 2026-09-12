@@ -63,14 +63,10 @@ python -B scripts/release_update.py download <附件URL> <本地zip路径> [--sh
    CORE 哈希仅证明内部一致，不是作者身份认证，也不证明代码安全。
 3. 解压到全新暂存目录，拒绝绝对路径、..、链接、重复/大小写碰撞与异常体积。下载与解压分开
    授权；当前更新器只接受已安全解压的核心目录，不自动执行下载/解压。默认不执行包内任意
-   脚本、不导入候选模块；唯一例外是下方“旧基线受控 bootstrap”：在官方 digest 核验与
-   用户逐次明确授权后，只运行候选包自带 `release_update.py` 的 plan-install/install 入口。
+   脚本、不导入候选模块。升级由已安装的可信更新器执行。
 4. 用旧版可信工具生成与执行计划（以下命令由 Agent 操作）：
 
-   注意：若本机核心版本早于 v0.21.2（如已发布的 v0.15.0-beta.1），其自带更新器不识别
-   --reviewed-manifest、也没有门禁身份表放行，跨版本新增组件时 plan-install 必然停止。
-   此时不要给旧更新器打补丁；按下文“旧基线受控 bootstrap”（首选）或
-   [兼容矩阵](compatibility-matrix.md) 的“备份+受控核心替换”（兜底）执行。
+   最低维护起点为 v0.21.5-beta.1；更早版本不在常规升级保证范围，保留其档案并说明需单独迁移评估。
 
 ```text
 python -B scripts/release_update.py plan-install <候选目录> --target <真实技能根目录> --expected-version <已确认标签> [--reviewed-manifest <审查收据>]
@@ -87,42 +83,19 @@ python -B scripts/release_update.py install <候选目录> --target <真实技�
      identity_change 审计字段；lineage/schema/API 变化仍停止常规更新。
    - 身份/schema 变化或需删旧文件时停止常规更新，另做可读迁移审查，不强制覆盖。
    已有授权不扩大为删除/系统配置更改。
-5. 更新器只事务替换核心，不读取 profile/绑定；无论来自本机可信目录还是受控 bootstrap，
+5. 更新器只事务替换核心，不读取 profile/绑定；使用本机可信目录，
    只调用 plan-install/install 入口，不执行包内其他脚本。备份与日志在目标父目录
    .wb-state/transactions。失败自动尝试回滚；文件占用等致回滚失败时保留日志并明确未完成。
    Agent 使用同一事务根的可信 safe_store.recover 前，核对事务目标和备份；遇独立外部修改
    不强制覆盖。不要让用户删除经验目录来解决更新问题。
 6. 档案不丢失是升级验收项，不是可选项：install 前必须先对私人 profile 做备份与基线记录
-   （v0.15.5+ 用 plan-backup/backup 或等效整档案备份；v0.15.0 基线按兼容矩阵做受控整目录
-   复制 + 逐文件哈希校验，记录 revision/records/effective_preferences）；install 后用新核心
+   （用 plan-backup/backup 或经核验的等效整档案备份，记录 revision/records/effective_preferences）；install 后用新核心
    核对 status/query 与基线一致并做一次续写，再报告完成。任何不一致或不可读时停止：保留
    核心备份与原档案，按 recover/备份恢复处理，不以“重建档案”作为恢复手段。数据格式变化
    时须先审查兼容性，不保证只回退核心就能读取新数据。
-
-## 旧基线（版本早于 v0.21.2）的受控 bootstrap
-
-背景：v0.15.0-beta.1（及任何早于 v0.21.2 的安装）自带更新器没有 --reviewed-manifest 与
-门禁身份表放行，跨版本新增组件时无法由其自身完成 plan-install；修复已内置在 v0.21.2+。
-因此旧基线先执行一次“候选包自带更新器”的受控 bootstrap，之后即可走常规升级。
-
-1. 检查、下载、解压与 digest 核验同本节前文；来源不明确或官方 digest 不一致即停止。
-2. 用户明确授权“执行候选包自带更新器完成本次升级”，该授权只覆盖本次 plan-install/
-   install，不扩大到运行包内其他脚本，也不构成后续自动升级授权。
-3. install 前先备份并记录私人 profile 基线（同本节第 6 条；档案保留优先于升级完成）。
-4. Agent 从候选解压目录运行其自带更新器（脚本所在目录即候选根，--target 必须指向真实
-   安装目录；新增组件时先构造 reviewed-manifest 收据）：
-
-```text
-python -B <候选目录>/scripts/release_update.py plan-install <候选目录> --target <真实技能根目录> --expected-version <已确认标签> [--reviewed-manifest <审查收据>]
-python -B <候选目录>/scripts/release_update.py install <候选目录> --target <真实技能根目录> --expected-version <已确认标签> --plan-id <计划ID> [--reviewed-manifest <审查收据>]
-```
-
-5. 用户审阅计划（版本、身份变更、新增组件收据、改动字节）后执行 install；安装后新会话
-   核验版本/加载与经验读取，并做一次续写，再报告完成。
-6. 边界：验签失败、用户拒绝、平台禁止执行候选脚本、档案校验不一致或任一步骤未通过时，
-   回退到
-   compatibility-matrix 的“备份 + 受控核心替换”兜底并如实说明；不给旧更新器打补丁、
-   不绕过校验。
+   升级成功并核验后，Agent 按 A5 默认规则自动（无需再询问）写一次 updates-mark：
+   channel=repo、state=checked、checked_at=当前 UTC、installed_version=latest_version=
+   新版本、summary=UPDATED，使账本 up_to_date=true，避免下次误提醒。
 
 ## 没装技术软件的用户
 
@@ -141,12 +114,23 @@ python -B <候选目录>/scripts/release_update.py install <候选目录> --targ
 环境。有的话由我完成；没有的话我带你按官方界面操作。你的经验会保留。”
 权限弹窗、实际安装界面和最终加载需真实环境确认，合成测试不代替真人可用性验收。
 
-## 账本与生态渠道
+## 自身仓库更新账本
 
-updates-check --dry-run 保留离线简报；Issues/PR/生态检索仍由 Agent 在授权后只读执行，
+updates-check --dry-run 保留离线简报；自身仓库Issues/PR查询仍由 Agent 在授权后只读执行，
 与“有正式新版”分开。updates-mark 的私人账本 schema 2 保留 channel/checked_at/summary，
-可带 latest_version/brief。失败 summary 写明确状态；旧 latest_version 只是历史，不冒充当前。
-跳过写 SKIPPED；检查器本身不写账本，只有 Agent 明确记账才修改 profile。不自动安装或发布。
+必带 state=checked/skipped/failed，checked_at 必须含时区；checked 可带
+installed_version/latest_version/brief/repo_status。每次联网检查后必须 updates-mark：
+成功记 checked，用户跳过记 skipped，失败记 failed；skipped/failed 仍使 due=true，
+不得把跳过或失败写成检查成功。旧 latest_version 只是历史，不冒充当前；installed_version
+与 latest_version 一致时 updates-status 输出 up_to_date=true。检查器本身不写账本，只有
+Agent 明确记账才修改 profile。不自动安装或发布。
 
 依据：[GitHub Releases API](https://docs.github.com/en/rest/releases/releases)、
 [SemVer](https://semver.org/)、[Python 官方安装说明](https://docs.python.org/3/using/index.html)。
+
+## 执行成本与验收分层
+
+- 开始前确认实际宿主、目标目录、Python 与绑定/档案可访问性；不得照抄其他客户端路径。宿主沙箱拒绝按宿主授权流程处理，经授权后真实网络失败才按网络状态停止，不换不可信来源。
+- 每个关键命令分别检查退出码；失败阻止依赖步骤。完整输出存本地日志，仅回传版本、计数、异常、事务与日志路径。权限只申请已明确的阶段范围，不扩大持久授权。
+- 维护者对候选执行全量回归与公开身份安装态验证；用户升级保留摘要、安全路径、新组件审查、完整备份、事务、档案比对和续写读回，不要求每位用户重复全量测试或改副本绕过已知失败。
+- 核心可用与新会话发现分开记录；发现/元数据机制变化或用户明确要求时验证新会话，其他补丁不强制另起会话重复全套。完成回复仍须简短介绍当前用途与可说的指令。

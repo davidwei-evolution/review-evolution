@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "purpose": "trigger-quality",
+  "note": "只校验“发现面”是否覆盖这些说法。宿主是否真的加载本技能仍由宿主自己的策略决定；正例要求对应词出现在 SKILL.md 的 frontmatter description 里，负例要求边界句存在（boundary 为 null 时只登记、不断言）。",
+  "cases": [
+    {"id": "pos-recall-on-start", "input": "开始这项工作之前，看看我以前有没有相关经验", "should_trigger": true, "expect_terms": ["开工前看看我有哪些相关经验"], "reason": "开工回查"},
+    {"id": "pos-retrospective", "input": "这次任务收尾帮我复盘一下，并记下确认的偏好", "should_trigger": true, "expect_terms": ["收尾复盘", "经验复盘"], "reason": "收尾沉淀"},
+    {"id": "pos-merge-devices", "input": "把我在另一台电脑积累的经验合并进来", "should_trigger": true, "expect_terms": ["合并其他设备或客户端的经验", "跨设备/跨客户端经验整合"], "reason": "跨端整合"},
+    {"id": "pos-postmortem", "input": "分析一下这次返工的原因，下次该检查什么", "should_trigger": true, "expect_terms": ["分析这次返工原因"], "reason": "防错复盘"},
+    {"id": "pos-preference", "input": "记一下我的偏好，别每次都重复问我", "should_trigger": true, "expect_terms": ["减少重复追问", "记下这个偏好或教训"], "reason": "偏好沉淀"},
+    {"id": "pos-habit", "input": "让 AI 更懂我的习惯，回复更个性化", "should_trigger": true, "expect_terms": ["理解用户习惯", "个性化"], "reason": "习惯校准"},
+    {"id": "pos-self-iteration", "input": "帮我按使用反馈迭代这个技能本身", "should_trigger": true, "expect_terms": ["自我迭代", "技能进化"], "reason": "技能自迭代"},
+    {"id": "pos-update", "input": "这个技能有没有新版本？", "should_trigger": true, "expect_terms": ["更新来自官方仓库"], "reason": "更新检查"},
+    {"id": "pos-intro", "input": "这个技能是干什么的？", "should_trigger": true, "expect_terms": ["自我介绍"], "reason": "首次介绍"},
+    {"id": "neg-polish", "input": "帮我把这段文案润色得自然一点", "should_trigger": false, "boundary": "不替代代码审查、文案润色或一般方案讨论", "reason": "文案润色不属于本技能"},
+    {"id": "neg-code-review", "input": "帮我审查一下这段代码有没有 bug", "should_trigger": false, "boundary": "不替代代码审查、文案润色或一般方案讨论", "reason": "代码审查不属于本技能"},
+    {"id": "neg-design", "input": "帮我设计一个数据库方案", "should_trigger": false, "boundary": "不替代代码审查、文案润色或一般方案讨论", "reason": "一般方案讨论不属于本技能"},
+    {"id": "neg-chitchat", "input": "今天天气怎么样", "should_trigger": false, "boundary": null, "reason": "纯闲聊，仅登记不断言"}
+  ]
+}

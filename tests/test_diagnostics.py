@@ -95,3 +95,31 @@ class Diagnostics(unittest.TestCase):
             self.assertEqual(result['status'],'BINDING_INVALID')
             self.assertIn('compatibility-matrix',result['next_step'])
 
+
+    def test_context_failure_diagnostics_are_readonly_and_private(self):
+        before=self.snapshot()
+        cases=[(PermissionError('secret-path'),'ACCESS_DENIED'),
+               (OSError('secret-path'),'BINDING_INVALID'),
+               (ValueError('Invalid contexts schema'),'BINDING_INVALID'),
+               (ValueError('Links/reparse points are unsupported: secret-path'),'BINDING_INVALID'),
+               (ValueError('No context binding for client/account'),'UNBOUND')]
+        for exc,status in cases:
+            with self.subTest(status=status,error=type(exc).__name__), patch.object(e,'active_context',return_value={'client':'c','account':'a'}), patch.object(e,'resolve_context_root',side_effect=exc), patch.object(st,'apply',side_effect=AssertionError('Write')):
+                result=cw.doctor()
+                self.assertEqual(result['status'],status)
+                self.assertNotIn('secret-path',str(result))
+                self.assertEqual(result['core_write_access'],'not-tested')
+                self.assertEqual(result['persistence'],'unknown')
+        self.assertEqual(before,self.snapshot())
+
+    def test_profile_link_guidance_and_no_write_claim(self):
+        with patch.object(e,'profile_root',side_effect=ValueError('Links/reparse points are unsupported: secret-path')):
+            result=cw.doctor(self.root)
+            self.assertEqual(result['status'],'PROFILE_INVALID')
+            self.assertIn('非链接',result['next_step'])
+            self.assertNotIn('secret-path',str(result))
+        result=cw.doctor(self.root)
+        self.assertEqual(result['status'],'OK')
+        self.assertEqual(result['write_access'],'not-tested')
+        self.assertEqual(result['core_write_access'],'not-tested')
+        self.assertEqual(result['persistence'],'unknown')

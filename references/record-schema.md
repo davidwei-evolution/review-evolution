@@ -48,7 +48,7 @@ S2 记录完整合成示例（所有值均为合成，使用时替换为真实�
 confirmed_by 原话或核验引用）：
 
 ```json
-{"id":"22222222222222222222222222222222","component":"s2","module":"release","scope":"general","category":"upgrade","state":"candidate","text":"跨版本升级因未知新组件停止时，先完成可读迁移审查，再用 --reviewed-manifest 精确放行，不改动校验代码。","task_id":"example-task","created_at":"2026-01-01T00:00:00Z","evidence":["合成示例，不是真实观察"],"s2_type":"execution","s2_applicability":"task-environment","s2_context":"仅在候选来源经官方 digest 核验、审查覆盖全部新增文件时适用","environment":{"os":"Windows","platform":"QwenWork","python_version":"3.14.7"},"cause":"旧门禁白名单不含新组件且更新器无合规续行参数","prevention":"迁移审查后使用 --reviewed-manifest 提供逐文件哈希与依据","counter_signal":"候选来源未验签、审查遗漏新增文件或需删除旧文件时，停止并拒绝安装"}
+{"id":"22222222222222222222222222222222","component":"s2","module":"release","scope":"general","category":"upgrade","state":"candidate","text":"跨版本升级因未知新组件停止时，先完成可读迁移审查，再用 --reviewed-manifest 精确放行，不改动校验代码。","task_id":"example-task","created_at":"2026-01-01T00:00:00Z","evidence":["合成示例，不是真实观察"],"s2_type":"execution","s2_applicability":"task-environment","s2_context":"仅在候选来源经官方 digest 核验、审查覆盖全部新增文件时适用","environment":{"os":"nt","platform":"win32","host":"QwenWork","python_version":"3.14.7"},"cause":"旧门禁白名单不含新组件且更新器无合规续行参数","prevention":"迁移审查后使用 --reviewed-manifest 提供逐文件哈希与依据","counter_signal":"候选来源未验签、审查遗漏新增文件或需删除旧文件时，停止并拒绝安装"}
 ```
 
 说明：S2 在通用必填（id/component/module/scope/category/state/text/task_id/created_at/
@@ -58,7 +58,6 @@ query 对 S2 记录返回 `environment_review`：自动比对 environment 与本
 （os/platform/python_version），给出 mismatched_keys/unverifiable_keys；只对标准键自动判断，
 其他环境因素仍需人工核对。
 
-JSON 以 UTF-8 文件传入各写命令（`add`/`add-event`/`log-s3`/`observe-s1`/`observe-s2`/
 `updates-mark`），也支持用 `-` 从 stdin 读取，避免临时文件与终端编码问题。
 偏好事件 source 建议取 `<客户端>:<任务或会话标识>` 粒度：同一来源对同一偏好重复表达会被
 事件 ID 去重，不计新增分数；explicit + confirmed_by 是单端直接生效的通道。
@@ -112,3 +111,19 @@ recalled 需要 opportunity。未关联偏好可省略 preference_id，但 hit �
 不会晋级、不改变 revision。归属不清的 S1/S2 记录先写 module=uncategorized（category 可标
 “待归类”）+ state=candidate，归位用新的 confirmed 修订（supersedes 旧记录）留痕。
 v0.20.3：分类 candidate 仅在目标也是 candidate 且正文、证据、原因、预防、反例与环境均未变化时停用目标；允许更正场景分类。其它候选修订保留为候选，不隐藏原件、不自动确认。读取旧档案同样按此视图计算，不改原字节。部分导出补齐此类状态依赖并确认范围扩展。
+
+## text 怎么写才搜得到：用“未来会怎么问”的词（2026-09-12，D3）
+
+回查是**词面匹配**（严格匹配；整次零命中时命令会自动放宽一次为中文二元字组／英文词的重叠匹配），
+**不是语义理解**。因此 `text` 要按“**未来我会怎么问这件事**”来写，而不是按当时的场景代号、内部
+隐语或临时说法写。
+
+- 反例（当时看得懂，未来搜不到）：`zip 里多了个目录`、`那个锁的问题`、`方案 A 的做法`；
+- 正例（未来会这么问）：`安装/打包时校验包内顶层目录与 SKILL.md name 一致`、
+  `档案写入偶发瞬时锁占用时先等待片刻再重试`、`改核心后先 reseal 再跑全量回归`；
+- 具体做法：写完 `text` 后自问“一周后我想起这件事，会输入哪 2–3 个词？”——把那几个词**写进 text**；
+- 检索侧配套：`recall`/`query` 先用 2–3 个短词；严格无命中时会自动放宽一次（结果标
+  `text_match=relaxed`，相关性须自行核对），仍未命中就按 `diagnosis.modules` 换词重试一次；
+- 边界：这只提高**词面命中率**，不等于语义检索；也不能为了好搜而夸大或改写事实，
+  事实仍以 `evidence` 为准，`text` 只是便于检索的表述。
+S3仅安装启用后按模块帮助记录问题，不提供开发日志入口。

@@ -95,4 +95,89 @@ class Gate(unittest.TestCase):
         self.assertFalse(any(f['rule']=='invalid-metadata' for f in report['findings']))
         self.assertEqual(g.check(data,receipt(data))['status'],'privacy-gate-passed')
 
+
+class StableChannel(unittest.TestCase):
+    """1.0-A: a stable release is a separate channel that must carry evidence."""
+
+    def stable(self,**meta):
+        base={'version':'1.0.0','release_ready':True,'canonical_name':'review-evolution'}
+        base.update(meta)
+        return payload('Public content',metadata=base)
+
+    def evidence(self,data,**over):
+        row={'tests_evidence':'303/303 通过（合成）','acceptance_evidence':'公开 Release 全链路验收（合成）',
+             'frozen_core_sha256':st.digest(data['CORE.json']),'confirmations':2}
+        row.update(over)
+        return row
+
+    def test_stable_version_requires_release_ready_true(self):
+        data=self.stable(release_ready=False)
+        report=g.scan_payload(data)
+        self.assertTrue(any(f['rule']=='invalid-metadata' for f in report['findings']))
+        with self.assertRaises(ValueError):g.check(data,receipt(data))
+
+    def test_development_core_cannot_claim_release_ready(self):
+        data=payload('x',metadata={'release_ready':True})
+        with self.assertRaises(ValueError):g.check(data,receipt(data))
+
+    def test_unknown_version_scheme_rejected(self):
+        for version in ('2.0.0-rc.1','1.0','0.22.6-beta.99-extra','v1.0.0'):
+            with self.subTest(version=version):
+                data=payload('x',metadata={'version':version,'release_ready':True})
+                self.assertTrue(any(f['rule']=='invalid-metadata' for f in g.scan_payload(data)['findings']))
+
+    def test_plain_scan_never_authorizes_a_stable_release(self):
+        report=g.scan_payload(self.stable())
+        self.assertIn('stable-evidence-required',[f['rule'] for f in report['findings']])
+
+    def test_stable_release_needs_the_evidence_block(self):
+        data=self.stable()
+        with self.assertRaises(ValueError):
+            g.check(data,receipt(data))
+
+    def test_stable_release_passes_only_with_complete_evidence(self):
+        data=self.stable()
+        row=receipt(data);row['stable_evidence']=self.evidence(data)
+        self.assertEqual(g.check(data,row)['status'],'privacy-gate-passed')
+        self.assertFalse(any(f['rule'].startswith('stable-evidence')
+                             for f in g.scan_payload(data,row)['findings']))
+
+    def test_stable_evidence_is_bound_to_this_core(self):
+        data=self.stable()
+        row=receipt(data);row['stable_evidence']=self.evidence(data,frozen_core_sha256='0'*64)
+        with self.assertRaises(ValueError) as ctx:g.check(data,row)
+        self.assertIn('frozen_core_sha256',str(ctx.exception))
+
+    def test_stable_evidence_needs_two_confirmations(self):
+        data=self.stable()
+        for value in (0,1,3,'two'):
+            with self.subTest(confirmations=value):
+                row=receipt(data);row['stable_evidence']=self.evidence(data,confirmations=value)
+                with self.assertRaises(ValueError):g.check(data,row)
+
+    def test_stable_evidence_needs_real_references(self):
+        data=self.stable()
+        for key in g.STABLE_EVIDENCE_REFERENCES:
+            with self.subTest(key=key):
+                row=receipt(data);row['stable_evidence']=self.evidence(data,**{key:'   '})
+                with self.assertRaises(ValueError):g.check(data,row)
+
+    def test_draft_carries_a_stable_evidence_skeleton(self):
+        data=self.stable()
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            for rel,blob in data.items():(root/rel).write_bytes(blob)
+            row=g.draft(root)
+            self.assertEqual('',row['stable_evidence']['tests_evidence'])
+            self.assertEqual('',row['stable_evidence']['frozen_core_sha256'])
+            self.assertEqual(0,row['stable_evidence']['confirmations'])
+        # A beta payload keeps the old shape: no stable skeleton. Build one explicitly instead of
+        # relying on the shipped core, which is a stable release since 1.0 (2026-09-12).
+        beta=payload('Public content',metadata={'version':'0.22.10-beta.1','release_ready':False})
+        with tempfile.TemporaryDirectory() as tmp:
+            beta_root=Path(tmp)
+            for rel,blob in beta.items():(beta_root/rel).write_bytes(blob)
+            self.assertNotIn('stable_evidence',g.draft(beta_root))
+
+
 if __name__=='__main__':unittest.main()

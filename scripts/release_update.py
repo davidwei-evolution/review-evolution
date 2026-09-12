@@ -128,8 +128,10 @@ def assets_of(row):
         out.append({'name':name,'url':url,'size':size})
     return out
 
-def failure(status,message,**kw):
-    row={'status':status,'message':message,'releases_page':PAGE,'cross_check':True}
+def failure(status,message,cross_check=True,**kw):
+    row={'status':status,'message':message,'cross_check':cross_check}
+    if cross_check:
+        row['releases_page']=PAGE
     row.update(kw);return row
 
 def evaluate(local,rows,complete=True,channel='all'):
@@ -196,9 +198,30 @@ def evaluate(local,rows,complete=True,channel='all'):
             'message':'发现新版 '+v+'（'+latest_type+'，本机 '+local_v+'）。请先阅读变化与兼容性说明。',
             'question':'是否需要更新？确认后我会获取指定版本、核验并备份，再替换核心，保留你的经验。'}
 
+def _edition_of(payload):
+    """U10: expose the edition and optional-module availability of a core payload."""
+    try:
+        row=parse_json(payload.get('runtime-policy.json',b'{}'))
+    except (ValueError,TypeError):
+        return {'edition':None,'s3_available':None}
+    return {'edition':row.get('edition'),'s3_available':bool(row.get('s3_available'))}
+
+
 def check(core=CORE,online=False,snapshot=None,channel='all'):
     try:
-        cp.verify(core)
+        try:
+            cp.verify(core)
+        except (ValueError,OSError,KeyError,TypeError) as ex:
+            # U7: a broken local install is not a publishing problem. Saying "需要联网复核"
+            # here sent a real run off chasing the network instead of the local file.
+            return failure('LOCAL_CORE_INVALID',
+                           '本机已安装的核心未通过完整性校验；这是本机问题，与发布源无关，不要反复联网重试。',
+                           cross_check=False,
+                           cross_check_reason='本机完整性问题，联网复核无关。',
+                           detail=str(ex),
+                           next_step=('先运行 python -B scripts/core_package.py verify --root <技能目录>；'
+                                      '再用 python -B scripts/core_package.py diff --root <技能目录> '
+                                      '[--reference <同版本原包>] 做只读诊断。'+cp.HOST_REWRITE_HINT))
         local=parse_json((Path(core)/'CORE.json').read_bytes())
         if online and snapshot is not None:raise ValueError('Select online or a saved snapshot, not both')
         if online:
@@ -304,7 +327,14 @@ def download_asset(url,out,sha256=None,max_bytes=64*1024*1024,force=False):
 def checked_core(root,label,reviewed=None):
     try:return core_bytes(root,reviewed)
     except ValueError as ex:
-        raise ValueError(label+' core invalid at '+str(root)+': '+str(ex)) from ex
+        message=label+' core invalid at '+str(root)+': '+str(ex)
+        # N1 (2026-09-12): verify() already appends the guidance, so only add it when absent -
+        # otherwise the same paragraph lands twice and reads like two different suggestions.
+        if (cp.HOST_REWRITE_HINT not in message
+                and any(token in str(ex) for token in
+                        ('Core content mismatch','Core is incomplete','unexpected files','Source changed'))):
+            message+=' | '+cp.HOST_REWRITE_HINT
+        raise ValueError(message) from ex
 
 def core_bytes(root,reviewed=None):
     root=st.no_links(root).resolve()
@@ -376,6 +406,13 @@ def install_plan(candidate,target,allow_dev=False,expected_version=None,review_r
                          +'. 完成迁移审查后重跑 plan-install --reviewed-manifest <JSON>。')
     review_path=st.no_links(Path(review_receipt)).resolve() if (added and review_receipt is not None) else None
     new,new_bytes=checked_core(candidate,'Candidate',reviewed=set(added) if added else None)
+    before_edition=_edition_of(old_bytes);after_edition=_edition_of(new_bytes)
+    capability_change=None
+    if before_edition.get('s3_available') and not after_edition.get('s3_available'):
+        # U10: switching from a dev package to the public one silently drops S3. Say it out loud.
+        capability_change={'s3_available':{'before':True,'after':False},
+                           'note':('本候选未附带可选 S3 模块（edition=public、s3_available=false）：'
+                                   'S3 命令将不可用；旧 S3 记录只读保留、不会被删除，需要读取请换回官方含 S3 包。')}
     version(expected_version)
     if new['version'].removeprefix('v')!=expected_version.removeprefix('v'):
         raise ValueError('Candidate version does not match the reviewed release tag')
@@ -400,6 +437,8 @@ def install_plan(candidate,target,allow_dev=False,expected_version=None,review_r
           'from_version':old['version'],'to_version':new['version'],'changes':changes,
           'candidate_manifest':st.digest(new_bytes['CORE.json']),'target_manifest':st.digest(old_bytes['CORE.json']),
           'component_review':component_review,'identity_change':identity_change,
+          'edition':after_edition.get('edition'),'s3_available':after_edition.get('s3_available'),
+          'capability_change':capability_change,
           'note':'Local content integrity only; verify official asset provenance and obtain user approval before applying.'}
     plan['plan_id']=st.digest(st.json_bytes(plan));return plan
 
@@ -418,14 +457,47 @@ def install(candidate,target,plan_id,allow_dev=False,expected_version=None,revie
         tx=st.apply(target.parent,writes,expected,already_locked=True)
         result=cp.verify(target)
         if result['sha256']!=plan['candidate_manifest']:raise ValueError('Installed verification failed; retain backup for recovery')
+        message='核心文件更新并核验完成。请新开相关会话确认技能可用，再查询已有经验。'
+        if plan.get('capability_change'):
+            message+=' 注意：'+plan['capability_change']['note']
         return {'status':'UPDATED','version':result['version'],'transaction':tx,
                 'backup':str(target.parent/st.STATE/'transactions'/tx),
-                'message':'核心文件更新并核验完成。请新开相关会话确认技能可用，再查询已有经验。'}
+                'edition':plan.get('edition'),'s3_available':plan.get('s3_available'),
+                'capability_change':plan.get('capability_change'),'message':message}
+
+def emit_receipt_template(candidate,target,out):
+    """U5: write the component-review skeleton (added files + real hashes + empty reason)."""
+    candidate=st.no_links(candidate).resolve();target=st.no_links(target).resolve()
+    out=st.no_links(Path(out)).resolve()
+    if out.is_relative_to(candidate) or out.is_relative_to(target):
+        raise ValueError('Write the receipt template outside the candidate and the target core')
+    if out.exists():
+        raise ValueError('Output must not exist; use a new file name')
+    cmeta=parse_json((candidate/'CORE.json').read_bytes())
+    old=parse_json((target/'CORE.json').read_bytes())
+    if not isinstance(cmeta.get('files'),dict) or not isinstance(old.get('files'),dict):
+        raise ValueError('Both directories need a readable CORE.json manifest')
+    added=sorted(set(cmeta['files'])-set(old['files']))
+    template={'schema':1,'purpose':'component-review','version':cmeta['version'],
+              'reviewed_by':'','reason':'','files':{rel:cmeta['files'][rel] for rel in added}}
+    st.atomic_bytes(out,st.json_bytes(template))
+    return {'status':'WROTE_TEMPLATE','out':str(out),'added':len(added),'files':added,
+            'next_step':('填写 reviewed_by 与 reason（键集合与摘要已由脚本算好，不要改动）后，'
+                         '用 plan-install --reviewed-manifest <该文件> 重跑。')}
+
+class UpdateArgumentParser(argparse.ArgumentParser):
+    """U6: cross-version CLI shapes changed (e.g. old `--candidate`), so every argparse
+    error should point at the change log instead of leaving historical scripts to fail blind."""
+    def error(self,message):
+        message+=('\n提示：跨版本升级时 CLI 参数形态可能变化，见 references/compatibility-matrix.md '
+                  '的“CLI 参数变更记录”。')
+        super().error(message)
+
 
 def main():
     for stream in (sys.stdout,sys.stderr):
         if hasattr(stream,'reconfigure'):stream.reconfigure(encoding='utf-8')
-    p=argparse.ArgumentParser(description=__doc__);sub=p.add_subparsers(dest='command',required=True)
+    p=UpdateArgumentParser(description=__doc__);sub=p.add_subparsers(dest='command',required=True)
     q=sub.add_parser('check');q.add_argument('--core',type=Path,default=CORE)
     mode=q.add_mutually_exclusive_group();mode.add_argument('--online',action='store_true');mode.add_argument('--snapshot',type=Path)
     q.add_argument('--stable-only',action='store_true',help='只比较正式发布；默认渠道同时包含预发布')
@@ -438,23 +510,35 @@ def main():
     r=sub.add_parser('verify-remote-tag',help='只读核验远端 tag 的 CORE.json 是否与本机候选一致（发布前预检）')
     r.add_argument('--tag',required=True);r.add_argument('--core',type=Path,default=CORE)
     for name in ('plan-install','install'):
-        q=sub.add_parser(name);q.add_argument('candidate',type=Path)
+        q=sub.add_parser(name);q.add_argument('candidate',type=Path,nargs='?')
+        q.add_argument('--candidate',dest='candidate_opt',type=Path,
+                       help='兼容旧写法的同义参数；与位置参数二选一')
         q.add_argument('--target',type=Path,required=True,help='真实待更新技能根目录（必填，避免误用脚本所在目录）')
         q.add_argument('--expected-version',required=True)
         q.add_argument('--allow-dev',action='store_true')
         q.add_argument('--reviewed-manifest',type=Path,default=None,
                        help='新增组件的迁移审查收据（schema 1/component-review），有新增文件时必填')
         if name=='install':q.add_argument('--plan-id',required=True)
+    t=sub.add_parser('emit-receipt-template',
+                     help='按新增文件生成 component-review 收据骨架（摘要由脚本计算，你只填 reviewed_by/reason）')
+    t.add_argument('--candidate',type=Path,required=True);t.add_argument('--target',type=Path,required=True)
+    t.add_argument('--out',type=Path,required=True)
     a=p.parse_args()
+    if a.command in ('plan-install','install'):
+        if a.candidate is None and a.candidate_opt is None:
+            p.error('需要候选目录：位置参数 <candidate> 或 --candidate <目录> 二选一')
+        a.candidate=a.candidate if a.candidate is not None else a.candidate_opt
     if a.command=='check':
         if a.stable_only and a.include_prerelease:p.error('--stable-only conflicts with --include-prerelease')
         result=check(a.core,a.online,a.snapshot,'stable' if a.stable_only else 'all')
     elif a.command=='download':result=download_asset(a.url,a.out,a.sha256,a.max_bytes,a.force)
     elif a.command=='verify-remote-tag':result=remote_tag_check(a.tag,a.core)
     elif a.command=='plan-install':result=install_plan(a.candidate,a.target,a.allow_dev,a.expected_version,a.reviewed_manifest)
+    elif a.command=='emit-receipt-template':result=emit_receipt_template(a.candidate,a.target,a.out)
     else:result=install(a.candidate,a.target,a.plan_id,a.allow_dev,a.expected_version,a.reviewed_manifest)
     print(json.dumps(result,ensure_ascii=False,indent=2))
-    if result.get('status') in ('VALIDATION_ERROR','RATE_LIMITED','NETWORK_ERROR','TIMEOUT','TLS_ERROR','HTTP_ERROR','NOT_FOUND','INCOMPLETE'):
+    if result.get('status') in ('VALIDATION_ERROR','LOCAL_CORE_INVALID','RATE_LIMITED','NETWORK_ERROR',
+                                'TIMEOUT','TLS_ERROR','HTTP_ERROR','NOT_FOUND','INCOMPLETE'):
         return 1
     return 0
 

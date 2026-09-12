@@ -4,6 +4,7 @@
 # ASCII-only for PowerShell 5.1 safety.
 param(
     [switch]$FindOnly,
+    [switch]$InstallAll,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$PassThru
 )
@@ -81,6 +82,57 @@ if (-not $python) {
 if ($FindOnly) {
     Write-Output $python
     exit 0
+}
+if ($InstallAll) {
+    # D1 (2026-09-12): one call instead of verify/init/bind/status/doctor, so a host that
+    # asks per command has one thing to authorize. Whether it really asks only once is the
+    # host's decision, not this script's - never promise a single prompt.
+    $env:PYTHONUTF8 = '1'
+    $env:PYTHONIOENCODING = 'utf-8'
+    Write-Host '[install] step 1/4: verifying skill files (read-only)...'
+    & $python -B (Join-Path $coreRoot 'scripts\core_package.py') verify
+    if ($LASTEXITCODE -ne 0) {
+        [Console]::Error.WriteLine('[install] core verification failed. Nothing was changed.')
+        exit 1
+    }
+    $base = $env:LOCALAPPDATA
+    if (-not $base) { $base = Join-Path $env:USERPROFILE 'AppData\Local' }
+    $dataRoot = Join-Path $base 'review-evolution'
+    $installation = Join-Path $dataRoot 'installation.json'
+    Write-Host '[install] step 2/4: checking for an existing local binding (never overwritten)...'
+    $bound = $null
+    if (Test-Path -LiteralPath $installation) {
+        try {
+            $bound = (Get-Content -LiteralPath $installation -Raw -Encoding UTF8 | ConvertFrom-Json).profile_root
+        } catch {
+            $bound = $null
+        }
+    }
+    if ($bound) {
+        Write-Host ('[install] existing profile found; reusing it and NOT creating a new one: ' + $bound)
+    } else {
+        $profileRoot = Join-Path $dataRoot 'profiles\default'
+        Write-Host '[install] step 3/4: no binding yet; preparing a private profile...'
+        Write-Host ('[install]   target: ' + $profileRoot)
+        if (-not (Test-Path -LiteralPath (Join-Path $profileRoot 'profile.json'))) {
+            & $python -B $scriptPath --profile $profileRoot init
+            if ($LASTEXITCODE -ne 0) {
+                [Console]::Error.WriteLine('[install] profile init failed. Nothing else was changed.')
+                exit 1
+            }
+        }
+        & $python -B $scriptPath bind $profileRoot
+        if ($LASTEXITCODE -ne 0) {
+            [Console]::Error.WriteLine('[install] binding failed. The profile itself is kept.')
+            exit 1
+        }
+    }
+    Write-Host '[install] step 4/4: read-only self check (doctor)...'
+    & $python -B $scriptPath doctor
+    $code = $LASTEXITCODE
+    Write-Host '[install] done. Your experience archive stays on this machine; nothing is uploaded.'
+    Write-Host '[install] You can now ask: "what have you remembered about me?"'
+    exit $code
 }
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
