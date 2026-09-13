@@ -122,8 +122,14 @@ def host_bookkeeping(rel):
         return True
     return any(part in HOST_BOOKKEEPING_DIRS for part in parts[:-1])
 
-def verify(root,allow_host_files=False):
+def verify(root,allow_host_files=False,tolerate=()):
+    """tolerate: 只读列出允许“与自身清单不符”的文件（宿主改写修复用，默认空集）。
+
+    默认行为不变：任何内容不符都直接拒绝。传入 tolerate 时这些文件仍会被**如实报告**在
+    `tolerated_mismatches` 里，由调用方决定是否用可信来源的同名文件覆盖；本函数不写盘。
+    """
     root=st.no_links(Path(root)).resolve()
+    tolerate=set(tolerate or ())
     meta=json.loads((root/'CORE.json').read_text(encoding='utf-8'))
     if meta.get('release_series')!='modular-1' or meta.get('data_schema')!=1:
         raise ValueError('Unsupported core metadata')
@@ -151,10 +157,14 @@ def verify(root,allow_host_files=False):
                              '; the host or OS wrote them into the skill directory. Core content itself is unchanged, '
                              'but integrity checks refuse extra files by default. Rerun with --allow-host-files to accept '
                              'them, or keep the core directory exclusive.')
+    mismatched=[]
     for rel,digest in files.items():
         if rel.startswith(('preferences/','legacy/','s1/','s2/','.wb-state/')):
             raise ValueError('Private/state path in core')
         if st.hash_file(st.inside(root,rel))!=digest:
+            if rel in tolerate:
+                mismatched.append(rel)
+                continue
             # U1: keep the stable wording, add what to do about a host-rewritten file.
             raise ValueError('Core content mismatch: '+rel+' | '+HOST_REWRITE_HINT)
     registry=json.loads((root/'public-methods/registry.json').read_text(encoding='utf-8'))
@@ -169,11 +179,14 @@ def verify(root,allow_host_files=False):
     if {p for p in files if p.startswith('public-methods/')}!=allowed:
         raise ValueError('Unregistered method file')
     ready=meta.get('release_ready') is True
-    return {'version':meta['version'],'files':len(files),'sha256':st.hash_file(root/'CORE.json'),
+    result={'version':meta['version'],'files':len(files),'sha256':st.hash_file(root/'CORE.json'),
             'release_ready':ready,
             'note':('Released core; integrity is not a privacy/security certification.'
                     if ready else
                     'Development core; integrity is not a privacy/security certification.')}
+    if mismatched:
+        result['tolerated_mismatches']=sorted(mismatched)
+    return result
 
 def export(root,out,review=None):
     root=st.no_links(Path(root)).resolve();out=st.no_links(Path(out)).resolve()

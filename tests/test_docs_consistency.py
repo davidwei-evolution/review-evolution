@@ -19,5 +19,10 @@ class DocsVersionConsistency(unittest.TestCase):
         self.assertIn(self.version,title)
 
     def test_changelog_leads_with_the_core_version(self):
-        first=(CORE/'CHANGELOG.md').read_text(encoding='utf-8').splitlines()[0]
-        self.assertIn(self.version,first)
+        text=(CORE/'CHANGELOG.md').read_text(encoding='utf-8')
+        public=json.loads((CORE/'CORE.json').read_text(encoding='utf-8'))['canonical_name']=='review-evolution'
+        if public:
+            self.assertTrue(text.startswith('# 更新说明'))
+            self.assertIn(self.version,text)
+        else:
+            self.assertIn(self.version,text.splitlines()[0])

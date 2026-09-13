@@ -68,6 +68,78 @@ def data_home():
         return Path.home()/'Library/Application Support/review-evolution'
     return Path(os.environ.get('XDG_DATA_HOME', Path.home()/'.local/share'))/'review-evolution'
 
+# 2026-09-13 用户决定：首次介绍时提示一次"把触发规则写进宿主每次都会读的规则面"，用户抱怨没触发时再提，
+# 之后每 90 天左右再提一次（宿主记忆可能被压缩/清空）。提示与记账都只落在**安装级**本地状态，
+# 不进私人档案、不随经验包转移；写宿主文件需要用户同意，逐次授权（技能外文件修改规则不变）。
+HOST_RULE_INTERVAL_DAYS=90
+HOST_RULE_TEXT=('- 当用户提到“经验复盘 / 记下偏好 / 自我迭代 / 为什么又返工 / 这个技能怎么用”时，'
+                '使用 review-evolution 技能。\n'
+                '- 用户要求记住偏好或习惯时，除本记忆/规则文件外，同时写入 review-evolution 的私人档案'
+                '（双写）；写入失败要如实说明。')
+HOST_RULE_WHERE=('优先写进“每次会话都会读取的规则面”：项目或全局的 AGENTS.md（推荐）；'
+                 '其次是客户端自带的长期记忆/规则文件（如 ~/.workbuddy/MEMORY.md 或等价位置）。'
+                 '每个客户端各写一份。')
+
+
+def host_rule_path():
+    return data_home()/'host-rule-advisory.json'
+
+
+def default_host_rule_state():
+    return {'schema':1,'last_advised_at':None,'declined':False,'advised_count':0}
+
+
+def load_host_rule_state():
+    path=host_rule_path()
+    if not path.is_file():
+        return default_host_rule_state()
+    try:
+        row=json.loads(path.read_text(encoding='utf-8'))
+    except (ValueError,OSError):
+        return default_host_rule_state()
+    if not isinstance(row,dict) or row.get('schema')!=1:
+        return default_host_rule_state()
+    base=default_host_rule_state();base.update(row);return base
+
+
+def host_rule_status(now=None):
+    """只读：现在是否该提示用户把触发规则写进宿主规则面。"""
+    row=load_host_rule_state()
+    last=row.get('last_advised_at');current=now or datetime.now(timezone.utc)
+    days=None
+    if isinstance(last,str):
+        try:
+            days=(current-datetime.fromisoformat(last)).days
+        except ValueError:
+            days=None
+    due=days is None or days>=HOST_RULE_INTERVAL_DAYS
+    return {'schema':1,'due':due,'last_advised_at':last,'days_since':days,
+            'interval_days':HOST_RULE_INTERVAL_DAYS,'declined':bool(row.get('declined')),
+            'advised_count':int(row.get('advised_count') or 0),
+            'placed_where':row.get('placed_where'),
+            'rule_text':HOST_RULE_TEXT,'where_to_put':HOST_RULE_WHERE,
+            'note':('这是“提高被调用概率”的提示，不保证每轮触发；写宿主文件前必须取得用户同意，'
+                    '不同意就把文本交给用户自行粘贴。')}
+
+
+def mark_host_rule(row):
+    """记账：已提示过、或用户拒绝、或已写入某处。只写安装级状态。"""
+    state=row.get('state')
+    if state not in ('advised','declined'):
+        raise ValueError('state must be advised or declined')
+    now=datetime.now(timezone.utc).isoformat(timespec='seconds')
+    root=data_home();root.mkdir(parents=True,exist_ok=True)
+    with st.locked(root):
+        current=load_host_rule_state()
+        current.update({'schema':1,'last_advised_at':now,'declined':state=='declined',
+                        'advised_count':int(current.get('advised_count') or 0)+1})
+        if row.get('placed_where'):
+            current['placed_where']=str(row['placed_where'])[:200]
+        st.atomic_bytes(host_rule_path(),st.json_bytes(current))
+    return {'status':'marked','state':state,'at':now,
+            'next_due_in_days':HOST_RULE_INTERVAL_DAYS}
+
+
 def binding_path():
     return data_home()/'installation.json'
 
@@ -334,7 +406,10 @@ def validate_record(row, component=None):
         if row['s2_type'] not in S2_TYPES or row['s2_applicability'] not in S2_APPLICABILITY:raise ValueError('Unknown S2 classification')
         if not isinstance(row['s2_context'],str) or not row['s2_context'].strip():raise ValueError('S2 context required')
         if row['s2_type']=='interaction' and row['s2_applicability']!='current-user':raise ValueError('Interaction methods are current-user only')
-    if row['component']=='s2':
+    # W3 (2026-09-13)：`state=retired` 的 S2 停用标记只是维护动作——它不参与召回、也不计分，
+    # 因此不再要求 cause/prevention/counter_signal/environment 四件套（原因写在 text 里即可），
+    # 避免为了通过校验而编造“因果”。正常 S2 记录的要求不变。
+    if row['component']=='s2' and row['state']!='retired':
         if not isinstance(row.get('environment'),dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in row['environment'].items()):
             raise ValueError('S2 environment must map names to version strings')
         for key in ('cause','prevention','counter_signal'):
@@ -722,6 +797,9 @@ def evidence_status(row):
 
 def add(root,row):
     validate_record(row)
+    # Validate an existing profile before locking can create filesystem state.
+    # Re-read under the lock below; this preflight does not replace concurrency checks.
+    info(root)
     rel=f"{row['component']}/records/{row['id']}.json"
     with st.locked(root):
         meta=info(root)
@@ -936,7 +1014,8 @@ def _query_s3(root,task_id=None,text=None,status=None,fuzzy=False,module=None,te
 def log_s3(root,row,record_time=False):
     import optional_features as features
     if features.policy(CORE)['edition']!='development':
-        raise ValueError('Development journal is not a public feature; use s3-record for installation/upgrade/runtime issues')
+        # 2026-09-13：公开版不提示任何内部模块入口（用户侧零痕迹）；该分支本身只在非公开形态触发。
+        raise ValueError('This record type is not available in the current edition.')
     return _log_s3(root,row,record_time)
 
 
@@ -2041,6 +2120,13 @@ def scene_census(root,threshold=None):
                 'scope_usage':sorted({s for e in labels.values() for s in e['scopes'] if s}),
                 'threshold':threshold,'threshold_note':'AI 默认值（8），非用户规则，可传 --threshold 调整',
                 'triggered':triggered,
+                # 2026-09-13（真机反馈 F1）：triggered 与 proposal 语义不同，容易被读成"触发了却没结果"。
+                'threshold_reached':triggered,
+                'triggered_means':'标签多样性达到阈值（不等于已有可归并项）',
+                'proposal_note':('已达阈值，但未发现拼写/大小写/相似标签变体，当前无需归并。'
+                                 if triggered and not proposal else
+                                 '未达阈值，暂不建议做场景归并。' if not triggered else
+                                 '发现可评估的归并候选；是否归并由你确认，历史标签保留。'),
                 'proposal':proposal,
                 'limits':'Read-only advisory. No record/event is rewritten; adopt canonical labels only after your confirmation.'}
 
@@ -2340,7 +2426,7 @@ def _validate_pack_dir(pack):
     closure(rows)
     return man,rows
 
-def import_plan(root,pack,merge_into_current=False):
+def import_plan(root,pack,merge_into_current=False,accept_state_changes=()):
     meta=info(root)
     man,incoming=validate_pack(pack)
     if meta['profile_id']!=man['profile_id']:
@@ -2348,10 +2434,31 @@ def import_plan(root,pack,merge_into_current=False):
             raise ValueError('Different profile: to merge into the current profile you must confirm ownership; '
                              'rerun plan-import --merge-into-current for a preview. Never merge different people implicitly.')
     rows=load_rows(root)
+    accept={str(x).strip() for x in (accept_state_changes or ()) if str(x).strip()}
     conflicts=[rel for rel,row in incoming.items() if rel in rows and rows[rel]!=row]
-    combined={**rows,**incoming}
+    # 2026-09-13 用户规则（含补充口径）：两端对同一记录/事件的**内容**不一致（同 ID 不同内容）时，
+    # 不用来源版本覆盖本端，也不中断整包导入；先把这些文件扣下、其余照常一次整合完，
+    # 最后把差异一次性列出由用户决定是否采用来源版本。放行后按来源内容覆盖本端（overwrite）。
+    def conflict_key(rel):
+        if rel.startswith(('s1/records/','s2/records/')):return Path(rel).stem
+        if rel.startswith('preferences/'):
+            row=incoming[rel];return '%s|%s'%(row.get('scope'),row.get('preference_id'))
+        return rel
+    held=set();discrepancies=[]
+    for rel in conflicts:
+        if conflict_key(rel) in accept:continue
+        held.add(rel)
+        local=rows[rel];source=incoming[rel]
+        discrepancies.append({'kind':'content','key':conflict_key(rel),'reason':'content-differs',
+                              'file':rel,'held_files':[rel],
+                              'local':{'state':local.get('state'),'text':local.get('text'),
+                                       'evidence':local.get('evidence')},
+                              'source':{'state':source.get('state'),'text':source.get('text'),
+                                        'evidence':source.get('evidence')}})
+    applied={rel:row for rel,row in incoming.items() if rel not in held}
+    combined={**rows,**applied}
     closure(combined)
-    check_write_budget(root,{rel:encoded(row) for rel,row in incoming.items() if rel not in rows})
+    check_write_budget(root,{rel:encoded(row) for rel,row in applied.items() if rel not in rows})
     before_events={Path(rel).stem:row for rel,row in rows.items() if rel.startswith('preferences/')}
     after_events={Path(rel).stem:row for rel,row in combined.items() if rel.startswith('preferences/')}
     before_snap=pe.snapshot(before_events)
@@ -2383,6 +2490,55 @@ def import_plan(root,pack,merge_into_current=False):
     states_after=effective_states(combined)
     record_changes=[{'id':rid,'before':states_before[rid],'after':states_after[rid]}
                     for rid in sorted(states_before) if states_before[rid]!=states_after[rid]]
+    # 2026-09-13 用户规则（合并不得覆盖本端状态）：同一条记录/偏好在两端状态不一致时，
+    # **扣下**造成变化的 incoming 文件；其余照常整合；最后一次性列出全部差异由用户裁决。
+    # 用户确认后用 --accept-state-change <记录ID 或 scope|preference_id> 重新出计划再应用。
+    local_by_id={Path(rel).stem:row for rel,row in rows.items()
+                 if rel.startswith(('s1/records/','s2/records/'))}
+    source_by_id={Path(rel).stem:row for rel,row in incoming.items()
+                  if rel.startswith(('s1/records/','s2/records/'))}
+    source_states=effective_states(source_by_id)
+    for change in record_changes:
+        rid=change['id']
+        if rid in accept:
+            continue
+        blockers=sorted(rel for rel,row in incoming.items()
+                        if row.get('supersedes')==rid and rel not in rows)
+        if not blockers:
+            continue
+        held.update(blockers)
+        local=local_by_id.get(rid) or {}
+        # W4 (2026-09-13)：差异条目统一为 kind/key/reason/held_files/local/source（+可选 merged_state），
+        # 让脚本和人都不必按 kind 猜字段；file/held_files 一律给相对路径。
+        discrepancies.append({'kind':'record','key':rid,'reason':'state-change',
+                              'held_files':list(blockers),'merged_state':change['after'],
+                              'local':{'state':change['before'],'text':local.get('text'),
+                                       'module':local.get('module')},
+                              'source':{'state':source_states.get(rid),
+                                        'markers':[{'file':b,'state':incoming[b].get('state'),
+                                                    'text':incoming[b].get('text'),
+                                                    'evidence':incoming[b].get('evidence')}
+                                                   for b in blockers]}})
+    for change in pref_changes:
+        if change.get('change')!='updated':
+            continue
+        fields=set(change.get('fields') or ())
+        if not fields:
+            continue
+        key=(change['scope'],change['preference_id'])
+        if f'{key[0]}|{key[1]}' in accept:
+            continue
+        blockers=sorted(rel for rel,row in incoming.items()
+                        if rel.startswith('preferences/') and rel not in rows
+                        and (row.get('scope'),row.get('preference_id'))==key)
+        if not blockers:
+            continue
+        held.update(blockers)
+        discrepancies.append({'kind':'preference','key':'%s|%s'%(key[0],key[1]),
+                              'reason':'state-change','scope':key[0],'preference_id':key[1],
+                              'changed_fields':sorted(fields),
+                              'local':change.get('before'),'source':change.get('after'),
+                              'held_files':list(blockers)})
     staged_before={s['event'] for s in before_snap['staged']}
     staged_after={s['event'] for s in after_snap['staged']}
     staged_changes=[]
@@ -2397,24 +2553,33 @@ def import_plan(root,pack,merge_into_current=False):
         merge={'merge_into_current':True,'source_profile_id':man['profile_id'],
                'target_profile_id':meta['profile_id'],
                'source_trusted':is_trusted_source(root,man['profile_id'])}
+    overwrite=sorted(rel for rel in set(incoming)&set(rows)
+                     if incoming[rel]!=rows[rel] and rel not in held)
     plan={'schema':1,'profile_id':meta['profile_id'],'before':profile_digest(root),
-          'pack_id':man['pack_id'],'add':sorted(set(incoming)-set(rows)),
-          'same':sorted(rel for rel in incoming if rel in rows and rows[rel]==incoming[rel]),'conflicts':conflicts,
+          'pack_id':man['pack_id'],
+          'add':[rel for rel in sorted(set(incoming)-set(rows)) if rel not in held],
+          'overwrite':overwrite,'hold':sorted(held),'discrepancies':discrepancies,
+          'same':sorted(rel for rel in incoming if rel in rows and rows[rel]==incoming[rel]),
+          'conflicts':conflicts,
           'rule_changes':{'preferences':pref_changes,'records':record_changes,'staged':staged_changes,
                           'incoming_evidence':[{'id':Path(rel).stem,'text':r.get('text'),
                               'scope':r.get('scope'),'module':r.get('module'),
                               'evidence':r.get('evidence'),'confirmed_by':r.get('confirmed_by'),
-                              'evidence_status':evidence_status(r)} for rel,r in incoming.items() if rel not in rows]},
+                              'evidence_status':evidence_status(r)} for rel,r in incoming.items()
+                              if rel not in rows or rel in overwrite]},
           'merge':merge,
           'permissions':'No system authorization is imported. S2 reuse requires environment review.'}
     plan['plan_id']=st.digest(encoded(plan))
     return plan
 
-def import_pack(root,pack,plan_id,merge_into_current=False,trust_reason=None):
+def import_pack(root,pack,plan_id,merge_into_current=False,trust_reason=None,accept_state_changes=()):
     with st.locked(root):
-        plan=import_plan(root,pack,merge_into_current=merge_into_current)
-        if plan['plan_id']!=plan_id or plan['conflicts']:
-            raise ValueError('Stale plan or immutable record conflict')
+        plan=import_plan(root,pack,merge_into_current=merge_into_current,
+                         accept_state_changes=accept_state_changes)
+        # 2026-09-13 用户规则：两端内容/状态不一致**不阻断整包**——不一致项已在计划里被扣下，
+        # 这里只校验计划是否过期；差异清单随结果回传，由用户逐项决定是否放行。
+        if plan['plan_id']!=plan_id:
+            raise ValueError('Stale plan; re-run plan-import (and keep --accept-state-change consistent)')
         man,rows=validate_pack(pack)
         if man['pack_id']!=plan['pack_id']:
             raise ValueError('Pack changed after preflight')
@@ -2451,15 +2616,24 @@ def import_pack(root,pack,plan_id,merge_into_current=False,trust_reason=None):
                 writes[rel]=encoded(rows[rel])
                 expected[rel]=None
             check_write_budget(root,{rel:writes[rel] for rel in plan['add']})
+        if plan.get('overwrite'):
+            for rel in plan['overwrite']:
+                writes[rel]=encoded(rows[rel])
+                expected[rel]=st.hash_file(st.inside(root,rel))
+            check_write_budget(root,{rel:writes[rel] for rel in plan['overwrite']})
         if not writes:
-            return {'status':'unchanged','added':0,'merge_into_current':bool(merge)}
+            return {'status':'unchanged','added':0,'merge_into_current':bool(merge),
+                    'updated':0,'held':plan['hold'],'discrepancies':plan['discrepancies']}
         old=st.hash_file(root/'profile.json')
         meta['revision']+=1
         writes['profile.json']=encoded(meta)
         expected['profile.json']=old
         tx=st.apply(root,writes,expected,already_locked=True)
-        result={'status':'imported' if plan['add'] else 'trusted-only',
-                'added':len(plan['add']),'transaction':tx,'plan_id':plan_id}
+        result={'status':('imported' if plan['add'] else
+                          ('updated' if plan['overwrite'] else 'trusted-only')),
+                'added':len(plan['add']),'updated':len(plan['overwrite']),
+                'transaction':tx,'plan_id':plan_id,
+                'held':plan['hold'],'discrepancies':plan['discrepancies']}
         if merge.get('merge_into_current'):
             result.update({'merge_into_current':True,
                            'source_profile_id':man['profile_id'],
@@ -2516,7 +2690,9 @@ def s2_classification_preview(root,limit=20):
     q=query(root,component='s2',s2_type='unclassified')
     rows=[r for r in q['records'] if r['effective_state'] in ('confirmed','candidate')]
     result={'profile_id':q['profile_id'],'revision':q['revision'],'read_only':True,'total':len(rows),'omitted':max(0,len(rows)-limit),
-            'items':[{'id':r['id'],'state':r['effective_state'],'text':r['text'],'cause':r['cause'],'prevention':r['prevention'],'evidence':r['evidence'],'suggested_type':None,'review_required':True} for r in rows[:limit]],
+            'items':[{'id':r['id'],'state':r['effective_state'],'text':r['text'],
+                      'cause':r.get('cause'),'prevention':r.get('prevention'),
+                      'evidence':r['evidence'],'suggested_type':None,'review_required':True} for r in rows[:limit]],
             'instructions':'核对证据后提出分类和适用范围，用户确认前不改历史；无充分依据保持未分类。确认后使用新增修订 supersedes 保留原件，不覆盖 ID 或重写效果记录。'}
     result['plan_id']=st.digest(encoded(result));return result
 
@@ -2568,7 +2744,7 @@ def introduction(core=CORE,focus='general',profile=None,allow_host_files=False):
          '把你说过的要求、做事习惯和协作偏好记下来，以后在别的对话里也能用上',
          '复盘这次任务，记下我确认的协作偏好',
          '我会区分“你明确说的”和“我猜的”：你确认过的才算数，我猜的只当待确认的便签。'),
-        ('error-review',('add','observe-s2','s2-metrics'),
+        ('error-review',('add',),
          '把踩过的坑和更好的做法记下来，包括工具操作、判断过程、交付格式，以及我怎么跟你沟通更顺',
          '分析这次返工原因，下次该检查什么',
          '尽量说清当时的场景和你希望的结果；记下来不等于以后绝不会再犯。'),
@@ -2588,9 +2764,9 @@ def introduction(core=CORE,focus='general',profile=None,allow_host_files=False):
          '按需把你的经验导出成文件，或把别处导出的经验并进来',
          '把我的工作经验迁移到另一客户端，先给我预览',
          '先给你看范围和冲突，你确认后我再动手；不会自动同步另外那台电脑。'),
-        ('outcomes',('observe-s1','s1-metrics'),
-         '看看记下来的偏好是不是真的减少了重复沟通',
-         '看看这些偏好是否真的减少了重复沟通',
+        ('outcomes',('s1-metrics',),
+         '查看以前保存的效果观察记录',
+         '查看历史效果记录',
          '需要真实使用中的观察；没有数据时我不会说“已经变好了”。'),
     ]
     cards=[dict(id=key,ability=ability,example=example,advice=advice)
@@ -2605,7 +2781,9 @@ def introduction(core=CORE,focus='general',profile=None,allow_host_files=False):
             cards.append(dict(id='updates',
                 ability='按你的要求检查有没有新版本，并说明改了什么',example='检查技能有没有新版，告诉我改了什么，先不要更新',
                 advice='检查和安装分开授权；查不到新版本时我会如实说明。'))
-    priority={'general':['recall','personal-experience','error-review'],
+    # 2026-09-13：跨端整合与备份恢复是本技能相对宿主自带记忆的核心差异点，
+    # 因此在通用场景里也排在前面（默认介绍会取前几张卡片）。
+    priority={'general':['recall','personal-experience','error-review','migration','backup'],
               'work':['error-review','personal-experience','recall'],
               'personal':['personal-experience','recall','outcomes'],
               'migration':['migration','recall','personal-experience'],
@@ -2616,6 +2794,13 @@ def introduction(core=CORE,focus='general',profile=None,allow_host_files=False):
         cards=[c for c in cards if c['id'] not in ('skill-review','outcomes')]
         if optional['enabled']:
             cards.append(dict(id='skill-issues',ability='记录和查询这个技能安装、升级、运行中遇到的问题',example='记录刚才的安装问题',advice='按需使用；不会自动改技能，也不会自动上传。'))
+    host_rule=host_rule_status()
+    if host_rule['due']:
+        cards.append(dict(id='host-rule',
+            ability='让你在别的对话里更容易想起我——我可以把一条很短的规则写进你客户端每次都会读的规则文件',
+            example='把这条规则加进我的规则文件，以后更容易调用',
+            advice=('写之前我会先问你是否同意；不同意我就把文本给你自己粘贴。'
+                    '写过之后我会记一笔，默认三个月后才再提一次。')))
     cards.sort(key=lambda card:priority.index(card['id']) if card['id'] in priority else len(priority))
     if profile is not None:
         try:
@@ -2628,13 +2813,15 @@ def introduction(core=CORE,focus='general',profile=None,allow_host_files=False):
         raise ValueError('Core changed during introduction')
     return dict(version=verified['version'],release_ready=verified['release_ready'],focus=focus,
         source='verified-local-core',capabilities=cards,profile_state=setup,
-        optional_s3=dict(optional,purpose='可选记录安装、升级、运行问题及按需查询分类迁移',cost='额外读取、生成和记录会增加token及操作成本；没有可靠计量，不承诺具体比例',installation_prompt='是否安装并加载S3？不选也可使用S1/S2和官方更新；旧S3不删除'),
+        **({'optional_s3':dict(optional,purpose='可选记录安装、升级、运行问题及按需查询分类迁移',cost='额外读取、生成和记录会增加token及操作成本；没有可靠计量，不承诺具体比例',installation_prompt='是否安装并加载S3？不选也可使用S1/S2和官方更新；旧S3不删除')}
+           if optional['edition']=='development' else {}),
+        **({'host_rule':host_rule} if host_rule['due'] else {}),
         composition={'language':('**整段介绍必须使用用户当前使用的语言**：用户说英文就用英文、说日文就用日文，'
                                  '不要中英混排、也不要只翻译标题。能力卡片里的中文事实由你自行翻译；'
                                  '内部标识保持英文原样且不念给用户。'
                                  'If the user writes in another language, answer entirely in that language.'),
                      'plain_language':('面向用户时**不得出现任何内部标识或技术词汇**：命令名与子命令名、'
-                                       '文件名、字段名、数据格式名、版本分类代号（如 S1/S2/S3 这类内部编号）、'
+                                       '文件名、字段名、数据格式名，以及任何内部编号或分类代号、'
                                        '以及"核心摘要/发布渠道"这类行话。用"我能做什么、你可以怎么说"来表述。'
                                        '反例：「add/add-event（记录新经验）」；正例：「把你说过的要求记下来，'
                                        '以后别的对话也能用上」。卡片里的 id 也是内部标识，不要念给用户。'),
@@ -2645,26 +2832,47 @@ def introduction(core=CORE,focus='general',profile=None,allow_host_files=False):
                 'Prefer introducing in the installation dialogue; host support and authorization govern any new dialogue.'])
 
 
-HELP_GROUPS=(
-    ('安装与维护',('init','bind','doctor','status','s3-status','s3-choice','intro','contexts','environment')),
-    ('日常使用',('recall','query','overview','consistency-check','add','add-event','log-s3',
-                 'observe-s1','observe-s2','s1-metrics','s2-metrics','candidate-status',
-                 'candidate-mark','scene-census','legacy-search','release-review')),
-    ('S3 可选模块与提醒账本',('s3-record','s3-classify','query-s3','plan-export-s3','export-s3',
-                              'plan-import-s3','import-s3','updates-status','updates-mark',
-                              'updates-check','archive-status','archive-mark','archive-check-target',
-                              'plan-confirm-candidates','confirm-candidates')),
+# 2026-09-13 用户要求：对外发布版不提供内部可选模块，用户侧（含命令行帮助）不应看到它的存在。
+# 该模块由开发版自带的 s3_optional.py 提供；模块不在时，相关子命令与帮助分组都不注册。
+try:
+    from importlib.util import find_spec as _find_spec
+    _OPTIONAL_MODULE=_find_spec('s3_optional') is not None
+except Exception:      # 开发环境探测失败时按“存在”处理，避免误伤开发版
+    _OPTIONAL_MODULE=True
+
+_REMINDER_AND_BACKUP=(
     ('备份与迁移',('plan-backup','backup','check-backup','plan-restore','restore','plan-export',
                    'export','pack-layout','plan-import','import','trusted-sources',
                    'trusted-sources-remove','s2-classification-preview','recover')),
 )
+_ALL_REST=((
+    '可选模块与提醒账本',('s3-record','s3-classify','query-s3','plan-export-s3','export-s3',
+                          'plan-import-s3','import-s3','updates-status','updates-mark',
+                          'updates-check','host-rule-status','host-rule-mark',
+                          'archive-status','archive-mark','archive-check-target',
+                          'plan-confirm-candidates','confirm-candidates')),
+)+_REMINDER_AND_BACKUP
+_PUBLIC_REST=((
+    '提醒账本',('updates-status','updates-mark','updates-check','archive-status','archive-mark',
+                'archive-check-target','host-rule-status','host-rule-mark',
+                'plan-confirm-candidates','confirm-candidates')),
+)+_REMINDER_AND_BACKUP
+HELP_GROUPS=(
+    ('安装与维护',('init','bind','doctor','status')+(('s3-status','s3-choice') if _OPTIONAL_MODULE else ())+
+                  ('intro','contexts','environment')),
+    ('日常使用',('recall','query','overview','consistency-check','add','add-event')+
+                 (('log-s3',) if _OPTIONAL_MODULE else ())+
+                 ('observe-s1','observe-s2','s1-metrics','s2-metrics','candidate-status',
+                  'candidate-mark','scene-census','legacy-search','release-review')),
+)+(_ALL_REST if _OPTIONAL_MODULE else _PUBLIC_REST)
 
 def help_epilog():
     """Grouped command index. The flat argparse list stays; this adds a usable map."""
     lines=['命令按角色分组（每个子命令的完整参数见 experience.py <子命令> --help）：']
     for title,commands in HELP_GROUPS:
         lines.append('  '+title+'：'+' '.join(commands))
-    lines.append('  JSON 仍是所有命令的默认输出；status / recall / doctor 支持 --human 输出人话版本。')
+    lines.append('  JSON 仍是所有命令的默认输出；status / recall / doctor / plan-import / import '
+                 '支持 --human 输出人话版本。')
     return '\n'.join(lines)
 
 def human_status(result):
@@ -2682,6 +2890,63 @@ def human_status(result):
         '  （plan-confirm-candidates 预览 → confirm-candidates 执行）。',
         '- 相关任务开工前，可以让我先查一次经验；任务收尾我会按证据把新事实写入本机档案。',
     ])
+
+
+def _one_line(value,limit=90):
+    if isinstance(value,dict):
+        text='；'.join('%s=%s' % (k,_one_line(v,40)) for k,v in value.items())
+    elif isinstance(value,(list,tuple)):
+        text='；'.join(_one_line(v,40) for v in value)
+    else:
+        text=' '.join(str(value or '').split())
+    return text if len(text)<=limit else text[:limit-1]+'…'
+
+
+def human_import(result):
+    """合并结果的人话版：先报整合结果，再**一次性**列出全部差异。JSON 仍是默认输出。"""
+    status=result.get('status')
+    lines=[]
+    if status is None:
+        lines.append('合并前预览：本次可新增 %s 条；按你的确认覆盖 %s 条（另有 %s 条内容相同）。'
+                     % (len(result.get('add') or []),len(result.get('overwrite') or []),
+                        len(result.get('same') or [])))
+    elif status=='imported':
+        lines.append('经验合并：已把没有争议的内容整合完成（新增 %s 条）。' % result.get('added',0))
+    elif status=='updated':
+        lines.append('经验合并：按你的确认，采用对方版本覆盖了本机 %s 条。' % result.get('updated',0))
+    elif status=='trusted-only':
+        lines.append('经验合并：没有可新增的经验，只登记了来源。')
+    else:
+        lines.append('经验合并：本机已有同样的内容，没有需要新增的记录。')
+    items=result.get('discrepancies') or []
+    if items:
+        lines.append('')
+        lines.append('以下 %d 条，两个端对同一件事的记录不一致。我按你的要求**先扣下、没有改动本机**：' % len(items))
+        for index,item in enumerate(items,1):
+            kind=item.get('kind')
+            where=item.get('file') or item.get('key')
+            if kind=='content':
+                lines.append('%d）内容不一致：%s' % (index,_one_line(where,70)))
+                lines.append('   本机版本：%s' % _one_line(item.get('local',{}).get('text')))
+                lines.append('   对方版本：%s' % _one_line(item.get('source',{}).get('text')))
+            elif kind=='record':
+                local=item.get('local') or {}
+                source=item.get('source') or {}
+                lines.append('%d）状态不一致：%s' % (index,_one_line(local.get('text'),60)))
+                lines.append('   本机状态：%s；对方状态：%s（合并后会变成：%s）'
+                             % (local.get('state'),source.get('state'),item.get('merged_state')))
+            else:
+                lines.append('%d）偏好不一致：%s（改动字段：%s）'
+                             % (index,item.get('key'),
+                                '、'.join(item.get('changed_fields') or [])))
+                lines.append('   本机：%s' % _one_line(item.get('local')))
+                lines.append('   对方：%s' % _one_line(item.get('source')))
+        lines.append('')
+        lines.append('逐条告诉我怎么处理就行：说“保留本机”就什么都不做；说“用对方版本”我会重新出计划，')
+        lines.append('放行后再应用（旧计划会作废，需要重新确认一次）。')
+    elif result.get('held'):
+        lines.append('（另有 %d 个文件被扣下，未改动本机。）' % len(result.get('held')))
+    return '\n'.join(lines)
 
 
 def _configure_stdio():
@@ -2704,12 +2969,13 @@ def build_parser():
                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--profile',type=Path)
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('recall');p.add_argument('--s2-type',choices=(*S2_TYPES,'unclassified'));p.add_argument('--scope',choices=pe.SCOPES);p.add_argument('--module');p.add_argument('--text');p.add_argument('--fuzzy',action='store_true');p.add_argument('--component',choices=COMPONENTS);p.add_argument('--limit',type=int,default=8);p.add_argument('--max-chars',type=int,default=5000);p.add_argument('--include-candidates',action='store_true');p.add_argument('--human',action='store_true',help='人类可读输出（默认仍是 JSON）')
+    p=sub.add_parser('recall');p.add_argument('--s2-type',choices=(*S2_TYPES,'unclassified'));p.add_argument('--scope',choices=pe.SCOPES);p.add_argument('--module');p.add_argument('--text');p.add_argument('--fuzzy',action='store_true');p.add_argument('--component',choices=COMPONENTS);p.add_argument('--limit',type=int,default=3);p.add_argument('--max-chars',type=int,default=3000);p.add_argument('--include-candidates',action='store_true');p.add_argument('--human',action='store_true',help='人类可读输出（默认仍是 JSON）')
     p=sub.add_parser('doctor');p.add_argument('--deep',action='store_true');p.add_argument('--allow-host-files',action='store_true');p.add_argument('--human',action='store_true',help='人类可读输出（默认仍是 JSON）')
-    sub.add_parser('s3-status')
-    p=sub.add_parser('s3-choice');p.add_argument('choice',choices=('enable','disable'));p.add_argument('--confirmed',action='store_true')
-    p=sub.add_parser('s3-record');p.add_argument('entry')
-    p=sub.add_parser('s3-classify');p.add_argument('record_id');p.add_argument('--category',required=True,choices=('installation','upgrade','runtime'));p.add_argument('--evidence',required=True)
+    if _OPTIONAL_MODULE:
+        sub.add_parser('s3-status')
+        p=sub.add_parser('s3-choice');p.add_argument('choice',choices=('enable','disable'));p.add_argument('--confirmed',action='store_true')
+        p=sub.add_parser('s3-record');p.add_argument('entry')
+        p=sub.add_parser('s3-classify');p.add_argument('record_id');p.add_argument('--category',required=True,choices=('installation','upgrade','runtime'));p.add_argument('--evidence',required=True)
     sub.add_parser('environment')
     sub.add_parser('plan-backup')
     p=sub.add_parser('backup');p.add_argument('output',type=Path);p.add_argument('--plan-id',required=True)
@@ -2733,21 +2999,23 @@ def build_parser():
     p.add_argument('--fuzzy',action='store_true')
     p=sub.add_parser('overview');p.add_argument('--scope',choices=pe.SCOPES)
     p=sub.add_parser('consistency-check');p.add_argument('--scope',choices=pe.SCOPES)
-    p=sub.add_parser('query-s3');p.add_argument('--task-id');p.add_argument('--text');p.add_argument('--status',choices=S3_STATES);p.add_argument('--fuzzy',action='store_true')
+    if _OPTIONAL_MODULE:
+        p=sub.add_parser('query-s3');p.add_argument('--task-id');p.add_argument('--text');p.add_argument('--status',choices=S3_STATES);p.add_argument('--fuzzy',action='store_true')
     p.add_argument('--module');p.add_argument('--terminal',choices=('pc','mobile','tablet','unknown'));p.add_argument('--applicability',choices=('core','environment','mixed','unknown'));p.add_argument('--verification',choices=('source-reported','local-reproduced','cross-environment','unknown'))
     p=sub.add_parser('release-review');p.add_argument('--limit',type=int,default=50)
     p=sub.add_parser('plan-confirm-candidates');p.add_argument('--ids');p.add_argument('--component',choices=COMPONENTS)
     p=sub.add_parser('confirm-candidates');p.add_argument('--ids');p.add_argument('--component',choices=COMPONENTS)
     p.add_argument('--plan-id',required=True);p.add_argument('--confirmed-by',required=True);p.add_argument('--task-id')
-    for command in ('plan-export-s3','export-s3'):
-        p=sub.add_parser(command)
-        if command=='export-s3':
-            p.add_argument('output',type=Path);p.add_argument('--plan-id',required=True)
-            p.add_argument('--zip',action='store_true',help='输出真正单层 zip（路径须以 .zip 结尾）')
-        p.add_argument('--module');p.add_argument('--terminal',choices=('pc','mobile','tablet','unknown'))
-    for command in ('plan-import-s3','import-s3'):
-        p=sub.add_parser(command);p.add_argument('pack',type=Path);p.add_argument('--merge-into-current',action='store_true')
-        if command=='import-s3':p.add_argument('--plan-id',required=True);p.add_argument('--trust-source')
+    if _OPTIONAL_MODULE:
+        for command in ('plan-export-s3','export-s3'):
+            p=sub.add_parser(command)
+            if command=='export-s3':
+                p.add_argument('output',type=Path);p.add_argument('--plan-id',required=True)
+                p.add_argument('--zip',action='store_true',help='输出真正单层 zip（路径须以 .zip 结尾）')
+            p.add_argument('--module');p.add_argument('--terminal',choices=('pc','mobile','tablet','unknown'))
+        for command in ('plan-import-s3','import-s3'):
+            p=sub.add_parser(command);p.add_argument('pack',type=Path);p.add_argument('--merge-into-current',action='store_true')
+            if command=='import-s3':p.add_argument('--plan-id',required=True);p.add_argument('--trust-source')
     p=sub.add_parser('add',help='新增 S1/S2 记录',
                      description='用法：add <JSON文件> 或 add -（从 stdin 读 UTF-8 JSON）。'
                                  '命令只接受一个 JSON 位置参数，不支持 --component/--module 等命名参数；'
@@ -2763,6 +3031,9 @@ def build_parser():
     p=sub.add_parser('s2-metrics');p.add_argument('--lesson')
     p=sub.add_parser('observe-s1');p.add_argument('outcome')
     p=sub.add_parser('s1-metrics');p.add_argument('--scope',choices=pe.SCOPES);p.add_argument('--preference-id')
+    sub.add_parser('host-rule-status')
+    p=sub.add_parser('host-rule-mark');p.add_argument('state',choices=('advised','declined'))
+    p.add_argument('--placed-where')
     p=sub.add_parser('updates-status')
     p=sub.add_parser('updates-mark');p.add_argument('mark')
     p=sub.add_parser('updates-check');p.add_argument('--dry-run',action='store_true')
@@ -2776,7 +3047,13 @@ def build_parser():
     p=sub.add_parser('export');p.add_argument('output',type=Path);p.add_argument('--components',nargs='+',choices=COMPONENTS,required=True);p.add_argument('--scope',choices=pe.SCOPES);p.add_argument('--module');p.add_argument('--plan-id');p.add_argument('--zip',action='store_true',help='输出真正单层 zip（路径须以 .zip 结尾）')
     p=sub.add_parser('pack-layout');p.add_argument('path',type=Path)
     p=sub.add_parser('plan-import');p.add_argument('pack',type=Path);p.add_argument('--merge-into-current',action='store_true')
+    p.add_argument('--accept-state-change',action='append',default=[],metavar='ID',
+                   help='允许该项按来源状态改变（记录ID 或 scope|preference_id）；默认扣下并列入差异清单')
+    p.add_argument('--human',action='store_true',help='人类可读输出（默认仍是 JSON）')
     p=sub.add_parser('import');p.add_argument('pack',type=Path);p.add_argument('--plan-id',required=True);p.add_argument('--merge-into-current',action='store_true');p.add_argument('--trust-source')
+    p.add_argument('--accept-state-change',action='append',default=[],metavar='ID',
+                   help='与 plan-import 同义的放行项；必须与出计划时一致，否则计划失效')
+    p.add_argument('--human',action='store_true',help='人类可读输出（默认仍是 JSON）')
     p=sub.add_parser('trusted-sources')
     p=sub.add_parser('trusted-sources-remove');p.add_argument('source_profile_id')
     p=sub.add_parser('legacy-search');p.add_argument('term')
@@ -2870,10 +3147,12 @@ def main():
         elif args.command=='add':result=(add_observation if args.observation else add)(root,read_payload(args.record))
         elif args.command=='add-event':result=add_event(root,read_payload(args.event))
         elif args.command=='log-s3':result=log_s3(root,read_payload(args.entry),args.record_time)
-        elif args.command=='observe-s2':result=log_s2_outcome(root,read_payload(args.outcome))
+        elif args.command=='observe-s2':raise ValueError('Daily outcome recording is retired. Use the separate manual evaluation tool; historical metrics remain readable.')
         elif args.command=='s2-metrics':result=s2_metrics(root,args.lesson)
-        elif args.command=='observe-s1':result=log_s1_outcome(root,read_payload(args.outcome))
+        elif args.command=='observe-s1':raise ValueError('Daily outcome recording is retired. Use the separate manual evaluation tool; historical metrics remain readable.')
         elif args.command=='s1-metrics':result=s1_metrics(root,args.scope,args.preference_id)
+        elif args.command=='host-rule-status':result=host_rule_status()
+        elif args.command=='host-rule-mark':result=mark_host_rule({'state':args.state,'placed_where':args.placed_where})
         elif args.command=='updates-status':result=updates_status(root)
         elif args.command=='updates-mark':result=mark_updates(root,read_payload(args.mark))
         elif args.command=='updates-check':
@@ -2889,16 +3168,21 @@ def main():
         elif args.command=='plan-export':result=export_plan(root,args.components,args.scope,args.module)
         elif args.command=='export':result=export_pack(root,args.output,args.components,args.scope,args.module,args.plan_id,args.zip)
         elif args.command=='plan-import':
-            with read_guard(root):result=import_plan(root,args.pack,merge_into_current=args.merge_into_current)
+            with read_guard(root):
+                result=import_plan(root,args.pack,merge_into_current=args.merge_into_current,
+                                   accept_state_changes=args.accept_state_change)
         elif args.command=='import':result=import_pack(root,args.pack,args.plan_id,
-                                                      merge_into_current=args.merge_into_current,
-                                                      trust_reason=args.trust_source)
+                                                     merge_into_current=args.merge_into_current,
+                                                     trust_reason=args.trust_source,
+                                                     accept_state_changes=args.accept_state_change)
         elif args.command=='trusted-sources':result=trusted_sources_view(root)
         elif args.command=='trusted-sources-remove':result=remove_trusted_source(root,args.source_profile_id)
         elif args.command=='legacy-search':result=legacy_search(root,args.term)
         else:
             if not re.fullmatch('[a-f0-9]{32}',args.transaction):raise ValueError('Invalid transaction')
             st.recover(root,args.transaction);result={'status':'recovered'}
+    if args.command in ('plan-import','import') and getattr(args,'human',False):
+        print(human_import(result));return
     print(json.dumps(result,ensure_ascii=False,indent=2))
 
 if __name__=='__main__':

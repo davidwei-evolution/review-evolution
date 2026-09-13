@@ -324,8 +324,10 @@ def download_asset(url,out,sha256=None,max_bytes=64*1024*1024,force=False):
     return {'status':'DOWNLOADED','path':str(out),'bytes':total,'sha256':digest,
             'expected_sha256':sha256,'message':'下载完成。仅字节完整不代表作者身份或代码安全，下一步仍需解压预检与内容核验。'}
 
-def checked_core(root,label,reviewed=None):
-    try:return core_bytes(root,reviewed)
+def checked_core(root,label,reviewed=None,tolerate=()):
+    if (Path(root)/'BUNDLE.json').is_file():
+        raise ValueError('这是已停止支持的旧版统一安装包形态：请改为把技能目录直接交给目标位置，或用本更新器的 plan-install/install 处理；不要把这个外层目录当作已安装核心。私人档案不受影响。')
+    try:return core_bytes(root,reviewed,tolerate=tolerate)
     except ValueError as ex:
         message=label+' core invalid at '+str(root)+': '+str(ex)
         # N1 (2026-09-12): verify() already appends the guidance, so only add it when absent -
@@ -336,9 +338,23 @@ def checked_core(root,label,reviewed=None):
             message+=' | '+cp.HOST_REWRITE_HINT
         raise ValueError(message) from ex
 
-def core_bytes(root,reviewed=None):
+
+def rewrite_mismatches(root):
+    """只读：列出安装目录里**与自身 CORE.json 清单不符**的文件（宿主改写/U1 场景）。不写盘。"""
+    root=st.no_links(Path(root)).resolve()
+    meta=parse_json((root/'CORE.json').read_bytes())
+    files=meta.get('files')
+    if not isinstance(files,dict):
+        raise ValueError('Target core invalid at '+str(root)+': manifest inventory missing')
+    missing=sorted(rel for rel in files if not st.inside(root,rel).is_file())
+    if missing:
+        raise ValueError('Target core invalid at '+str(root)+': Core is incomplete; missing files: '+repr(missing))
+    return sorted(rel for rel,digest in files.items() if st.hash_file(st.inside(root,rel))!=digest)
+
+def core_bytes(root,reviewed=None,tolerate=()):
     root=st.no_links(root).resolve()
     reviewed=set(reviewed or ())
+    tolerate=set(tolerate or ())
     count=total=0
     for path in root.rglob('*'):
         st.no_links(path)
@@ -346,7 +362,7 @@ def core_bytes(root,reviewed=None):
             count+=1;total+=path.stat().st_size
             if count>200 or path.stat().st_size>4*1024*1024 or total>32*1024*1024:
                 raise ValueError('Core exceeds automatic update capacity')
-    cp.verify(root)
+    cp.verify(root,tolerate=tolerate)
     meta=parse_json((root/'CORE.json').read_bytes())
     if meta.get('core_api')!=1:raise ValueError('Unsupported core API; manual migration required')
     if len(meta['files'])>200:raise ValueError('Core too large for automatic update')
@@ -359,7 +375,8 @@ def core_bytes(root,reviewed=None):
         path=st.inside(root,rel)
         if path.stat().st_size>4*1024*1024:raise ValueError('Core file too large')
         payload[rel]=path.read_bytes()
-        if rel!='CORE.json' and st.digest(payload[rel])!=meta['files'][rel]:raise ValueError('Source changed')
+        if rel!='CORE.json' and st.digest(payload[rel])!=meta['files'][rel] and rel not in tolerate:
+            raise ValueError('Source changed')
     if pending:
         raise ValueError('New core component(s) need explicit review before update: '
                          +', '.join(sorted(pending))
@@ -389,10 +406,21 @@ def parse_component_review(path,version,added,new_bytes):
             raise ValueError('Review receipt hash mismatch for '+rel)
     return {'receipt':st.digest(raw),'files':sorted(added),'reviewed_by':rec['reviewed_by'],'reason':rec['reason']}
 
-def install_plan(candidate,target,allow_dev=False,expected_version=None,review_receipt=None):
+def install_plan(candidate,target,allow_dev=False,expected_version=None,review_receipt=None,
+                 repair_host_rewrite=False):
     candidate=st.no_links(candidate).resolve();target=st.no_links(target).resolve()
     if candidate.is_relative_to(target) or target.is_relative_to(candidate):raise ValueError('Use a separate candidate directory')
-    old,old_bytes=checked_core(target,'Target')
+    # R1 (2026-09-13, W1)：目标核心被宿主「上传/注册」路径改写时，默认仍然拒绝并给出处置指引；
+    # 只有显式 --repair-host-rewrite 才允许继续——且必须满足“每个不符文件都由候选包同名文件覆盖”，
+    # 修复后的最终状态必须是候选包逐字节的官方内容（install 结束仍会整目录 verify）。
+    repair=None
+    if repair_host_rewrite:
+        mismatched=rewrite_mismatches(target)
+        if mismatched:
+            repair={'requested':True,'files':mismatched}
+        old,old_bytes=checked_core(target,'Target',tolerate=set(mismatched))
+    else:
+        old,old_bytes=checked_core(target,'Target')
     try:cmeta=parse_json((candidate/'CORE.json').read_bytes())
     except (ValueError,OSError) as ex:
         raise ValueError('Candidate core invalid at '+str(candidate)+': '+str(ex)) from ex
@@ -409,10 +437,11 @@ def install_plan(candidate,target,allow_dev=False,expected_version=None,review_r
     before_edition=_edition_of(old_bytes);after_edition=_edition_of(new_bytes)
     capability_change=None
     if before_edition.get('s3_available') and not after_edition.get('s3_available'):
-        # U10: switching from a dev package to the public one silently drops S3. Say it out loud.
+        # U10: switching from a development package to the public one silently drops an optional
+        # capability. Say it out loud, without naming the internal module (user-visible message).
         capability_change={'s3_available':{'before':True,'after':False},
-                           'note':('本候选未附带可选 S3 模块（edition=public、s3_available=false）：'
-                                   'S3 命令将不可用；旧 S3 记录只读保留、不会被删除，需要读取请换回官方含 S3 包。')}
+                           'note':('本候选的发行形态与当前安装不同（edition=public）：部分可选能力将不可用；'
+                                   '既有记录只读保留、不会被删除，需要继续使用请换回原发行形态。')}
     version(expected_version)
     if new['version'].removeprefix('v')!=expected_version.removeprefix('v'):
         raise ValueError('Candidate version does not match the reviewed release tag')
@@ -432,20 +461,35 @@ def install_plan(candidate,target,allow_dev=False,expected_version=None,review_r
     if set(old_bytes)-set(new_bytes):raise ValueError('Update removes files; explicit migration/deletion review required')
     changes={rel:{'before':st.digest(old_bytes[rel]) if rel in old_bytes else None,'after':st.digest(data)}
              for rel,data in new_bytes.items() if old_bytes.get(rel)!=data}
+    if repair:
+        # 被改写的文件必须被候选包的官方同名文件覆盖；否则不提供“修复后继续”，避免留下半修状态。
+        absent=sorted(rel for rel in repair['files'] if rel not in new_bytes)
+        if absent:
+            raise ValueError('Host-rewrite repair needs the same-named file inside the candidate package; missing: '
+                             +repr(absent)+'. 请改用同版本原包复原该文件后再升级（见 references/install.md）。')
+        for rel in repair['files']:
+            changes[rel]={'before':st.digest(old_bytes[rel]),'after':st.digest(new_bytes[rel]),
+                          'host_rewrite_repair':True}
+        repair={'requested':True,
+                'files':{rel:{'installed':st.digest(old_bytes[rel]),'manifest_expected':old['files'][rel]}
+                         for rel in repair['files']}}
     component_review=parse_component_review(review_path,new['version'],added,new_bytes) if added else None
     plan={'schema':1,'candidate':str(candidate),'target':str(target),'allow_dev':allow_dev,'expected_version':expected_version,
           'from_version':old['version'],'to_version':new['version'],'changes':changes,
           'candidate_manifest':st.digest(new_bytes['CORE.json']),'target_manifest':st.digest(old_bytes['CORE.json']),
           'component_review':component_review,'identity_change':identity_change,
           'edition':after_edition.get('edition'),'s3_available':after_edition.get('s3_available'),
-          'capability_change':capability_change,
+           'capability_change':capability_change,
+           'repair':repair,
           'note':'Local content integrity only; verify official asset provenance and obtain user approval before applying.'}
     plan['plan_id']=st.digest(st.json_bytes(plan));return plan
 
-def install(candidate,target,plan_id,allow_dev=False,expected_version=None,review_receipt=None):
+def install(candidate,target,plan_id,allow_dev=False,expected_version=None,review_receipt=None,
+            repair_host_rewrite=False):
     target=st.no_links(target).resolve()
     with st.locked(target.parent):
-        plan=install_plan(candidate,target,allow_dev,expected_version,review_receipt)
+        plan=install_plan(candidate,target,allow_dev,expected_version,review_receipt,
+                          repair_host_rewrite=repair_host_rewrite)
         if plan['plan_id']!=plan_id:raise ValueError('Stale/unapproved update plan')
         reviewed=set((plan.get('component_review') or {}).get('files') or [])
         meta,payload=checked_core(candidate,'Candidate',reviewed=reviewed)
@@ -458,6 +502,10 @@ def install(candidate,target,plan_id,allow_dev=False,expected_version=None,revie
         result=cp.verify(target)
         if result['sha256']!=plan['candidate_manifest']:raise ValueError('Installed verification failed; retain backup for recovery')
         message='核心文件更新并核验完成。请新开相关会话确认技能可用，再查询已有经验。'
+        if plan.get('repair'):
+            message=('检测到已装核心中有 '+str(len(plan['repair']['files']))
+                     +' 个文件与发布清单不符（宿主写入所致），已用候选包中的同名官方文件覆盖并重新校验；'
+                     '核心现与发布清单逐字节一致。请新开相关会话确认技能可用，再查询已有经验。')
         if plan.get('capability_change'):
             message+=' 注意：'+plan['capability_change']['note']
         return {'status':'UPDATED','version':result['version'],'transaction':tx,
@@ -518,6 +566,9 @@ def main():
         q.add_argument('--allow-dev',action='store_true')
         q.add_argument('--reviewed-manifest',type=Path,default=None,
                        help='新增组件的迁移审查收据（schema 1/component-review），有新增文件时必填')
+        q.add_argument('--repair-host-rewrite',action='store_true',
+                       help='（U1/W1）目标核心被宿主改写时：允许用候选包中的同名官方文件覆盖这些文件后继续升级；'
+                            '只影响“与自身清单不符”的文件，结束后仍做整目录核验；默认不启用')
         if name=='install':q.add_argument('--plan-id',required=True)
     t=sub.add_parser('emit-receipt-template',
                      help='按新增文件生成 component-review 收据骨架（摘要由脚本计算，你只填 reviewed_by/reason）')
@@ -533,9 +584,11 @@ def main():
         result=check(a.core,a.online,a.snapshot,'stable' if a.stable_only else 'all')
     elif a.command=='download':result=download_asset(a.url,a.out,a.sha256,a.max_bytes,a.force)
     elif a.command=='verify-remote-tag':result=remote_tag_check(a.tag,a.core)
-    elif a.command=='plan-install':result=install_plan(a.candidate,a.target,a.allow_dev,a.expected_version,a.reviewed_manifest)
+    elif a.command=='plan-install':result=install_plan(a.candidate,a.target,a.allow_dev,a.expected_version,
+                                                       a.reviewed_manifest,repair_host_rewrite=a.repair_host_rewrite)
     elif a.command=='emit-receipt-template':result=emit_receipt_template(a.candidate,a.target,a.out)
-    else:result=install(a.candidate,a.target,a.plan_id,a.allow_dev,a.expected_version,a.reviewed_manifest)
+    else:result=install(a.candidate,a.target,a.plan_id,a.allow_dev,a.expected_version,a.reviewed_manifest,
+                        repair_host_rewrite=a.repair_host_rewrite)
     print(json.dumps(result,ensure_ascii=False,indent=2))
     if result.get('status') in ('VALIDATION_ERROR','LOCAL_CORE_INVALID','RATE_LIMITED','NETWORK_ERROR',
                                 'TIMEOUT','TLS_ERROR','HTTP_ERROR','NOT_FOUND','INCOMPLETE'):

@@ -14,9 +14,9 @@ REFS={'s3-issues.md','workflow.md','record-schema.md','pack-format.md','install.
       'preference-plan-a.md','task-start-checklist.md','release-check.md',
       'conversations/index.md','conversations/s2-hit-register.md','update-brief.md',
       'client-acceptance.md','compatibility-matrix.md','feedback-template.md',
-      'host-integration.md'}
-SCRIPTS={'optional_features.py','s3_optional.py','build_public.py','recall_view.py','diagnostics.py','profile_backup.py','experience.py','preference_engine.py','safe_store.py','core_package.py','release_gate.py','release_update.py','check_windows_launchers.py','re-cli.ps1','verify-core.ps1'}
-TESTS={'test_optional_s3.py','test_s2_classification.py','test_recall_view.py','test_diagnostics.py','test_profile_backup.py','test_components.py','test_release_gate.py','test_release_update.py','test_archive_reminder.py','test_windows_launchers.py','test_export_robustness.py','test_import_and_host_compat.py','test_docs_consistency.py','test_recall_relaxed.py','test_release_readiness.py','test_candidate_fallback.py','test_candidate_reminder.py','test_skill_metadata.py','test_trigger_evals.py','test_install_entry.py','test_human_view.py','test_upgrade_recovery.py'}
+      'host-integration.md','public-release-notes.json'}
+SCRIPTS={'run_tests.py','optional_features.py','s3_optional.py','build_public.py','recall_view.py','diagnostics.py','profile_backup.py','experience.py','preference_engine.py','safe_store.py','core_package.py','release_gate.py','release_update.py','check_windows_launchers.py','re-cli.ps1','verify-core.ps1'}
+TESTS={'test_audit_fixes.py','test_optional_s3.py','test_s2_classification.py','test_recall_view.py','test_diagnostics.py','test_profile_backup.py','test_components.py','test_release_gate.py','test_release_update.py','test_archive_reminder.py','test_windows_launchers.py','test_export_robustness.py','test_import_and_host_compat.py','test_docs_consistency.py','test_recall_relaxed.py','test_release_readiness.py','test_candidate_fallback.py','test_candidate_reminder.py','test_skill_metadata.py','test_trigger_evals.py','test_install_entry.py','test_human_view.py','test_upgrade_recovery.py','test_public_content_boundary.py','test_advisory_and_wording.py','test_merge_state_discrepancies.py'}
 EVALS=re.compile(r'[a-z0-9][a-z0-9._-]*\.json\Z')
 # tests/__init__.py lets the suite be discovered from outside the skill root (U8).
 TEST_HELPERS={'__init__.py'}
@@ -46,7 +46,15 @@ PATTERNS={
     'assigned-secret':re.compile(r'''(?i)(?:api_key|password|access_token|client_secret)\s*[=:]\s*["'][A-Za-z0-9_+/=-]{12,}["']'''),
     'private-runtime-json':re.compile(r'''["'](?:profile_root|generated_by|device_id|repo_published_at)["']\s*:\s*["'][^"']+["']'''),
 }
-HARD={'private-key','access-token','assigned-secret','private-runtime-json','invalid-utf8','forbidden-path','invalid-metadata','stable-evidence-invalid'}
+HARD={'private-key','access-token','assigned-secret','private-runtime-json','invalid-utf8','forbidden-path','invalid-metadata','stable-evidence-invalid','public-development-document','public-development-history','optional-module-trace'}
+# 2026-09-13 用户要求：对外发布版是单一形态，用户可见面（文档与数据文件）不得出现内部可选模块的
+# 任何痕迹——不写“支持”、也不写“不支持”，而是完全不出现。
+OPTIONAL_TRACE=re.compile(r's3',re.I)
+PUBLIC_FORBIDDEN={'references/release-check.md','references/installer-review-template.md',
+                  'references/client-acceptance.md','references/compatibility-matrix.md',
+                  'references/host-integration.md','references/preference-plan-a.md',
+                  'references/conversations/index.md','references/conversations/s2-hit-register.md',
+                  'references/public-release-notes.json'}
 
 def permitted(rel):
     st.relative(rel)
@@ -63,6 +71,24 @@ def finding(rel,rule,line,payload_digest,match=''):
     row={'file':rel,'rule':rule,'line':line,'file_sha256':payload_digest,'match_sha256':st.digest(match.encode())}
     row['id']=st.digest(st.json_bytes(row))
     return row
+
+def public_content_findings(payload,meta):
+    """Block developer-only documents and historical ledgers in public candidates."""
+    if meta.get('canonical_name')!='review-evolution':
+        return []
+    rows=[]
+    for rel in sorted(PUBLIC_FORBIDDEN & set(payload)):
+        rows.append(finding(rel,'public-development-document',0,st.digest(payload[rel])))
+    for rel in ('CHANGELOG.md','KNOWN_ISSUES.md'):
+        text=payload.get(rel,b'').decode('utf-8','replace')
+        if ('## fixed' in text.lower() or re.search(r'(?i)(?<![\d.])v?0\.\d|beta|审计|回归|开发过程|测试流水',text)):
+            rows.append(finding(rel,'public-development-history',0,st.digest(payload.get(rel,b''))))
+    for rel in sorted(set(payload)):
+        if rel=='CORE.json' or not rel.endswith(('.md','.json')):
+            continue
+        if OPTIONAL_TRACE.search(payload[rel].decode('utf-8','replace')):
+            rows.append(finding(rel,'optional-module-trace',0,st.digest(payload[rel])))
+    return rows
 
 def stable_evidence_problems(payload,receipt):
     """Problems that block a stable release. Only the frozen hash is machine-checkable;
@@ -117,6 +143,8 @@ def scan_payload(payload,receipt=None):
     except (KeyError,ValueError,TypeError):
         meta=None
         findings.append(finding('CORE.json','invalid-metadata',0,st.digest(payload.get('CORE.json',b''))))
+    if meta is not None:
+        findings.extend(public_content_findings(payload,meta))
     if meta is not None and STABLE_VERSION.fullmatch(meta['version']):
         problems=stable_evidence_problems(payload,receipt)
         if problems:

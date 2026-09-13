@@ -78,7 +78,7 @@ def _no_match_diagnosis(root,q,scope=None,module=None,text=None,fuzzy=False,
     return {'code':'NO_MATCH','reason':'当前筛选范围内没有匹配记录',
             'retry':'调整 scope/module/关键词后重试一次','note':'只读结论，不触发全量回退或自动改写。'}
 
-def recall(root, scope=None, module=None, text=None, fuzzy=False, limit=8, max_chars=5000, include_candidates=False, component=None,s2_type=None):
+def recall(root, scope=None, module=None, text=None, fuzzy=False, limit=3, max_chars=3000, include_candidates=False, component=None,s2_type=None):
     if not 1<=limit<=30 or not 1200<=max_chars<=12000:
         raise ValueError('Recall limit must be 1..30 and max-chars 1200..12000')
     q=e.query(root,component=component,scope=scope,module=module,text=text,fuzzy=fuzzy,s2_type=s2_type)
@@ -113,7 +113,9 @@ def recall(root, scope=None, module=None, text=None, fuzzy=False, limit=8, max_c
               'text':r['text'],'evidence':r['evidence'],'task_id':r['task_id']}
         if r['component']=='s2':
             item.update(s2_type=r.get('s2_type','unclassified'),s2_applicability=r.get('s2_applicability','unspecified'),s2_context=r.get('s2_context','未分类，需核对适用性'))
-            item.update(cause=r['cause'],prevention=r['prevention'],counter_signal=r['counter_signal'],
+            # 停用标记（state=retired）按 W3 不再要求因果四件套，这里改为容错读取。
+            item.update(cause=r.get('cause'),prevention=r.get('prevention'),
+                        counter_signal=r.get('counter_signal'),
                         environment_review=r['environment_review'])
         items.append(item)
     # Rank only with explicit query context; this is lexical selection, not authority.

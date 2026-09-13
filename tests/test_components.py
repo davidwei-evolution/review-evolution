@@ -120,8 +120,16 @@ class Components(unittest.TestCase):
         pd=self.base/'pack-conflict';e.export_pack(d,pd,('s1','s2'))
         plan=e.import_plan(c,pd)
         self.assertTrue(plan['conflicts'])
-        with self.assertRaises(ValueError):e.import_pack(c,pd,plan['plan_id'])
+        # 2026-09-13 用户规则补充口径：同 ID 内容不同不再中断整包——先扣下并列入差异清单。
+        self.assertEqual([x['kind'] for x in plan['discrepancies']],['content'])
+        self.assertEqual(plan['overwrite'],[])
+        self.assertEqual(e.import_pack(c,pd,plan['plan_id'])['status'],'unchanged')
         self.assertEqual(before,e.profile_digest(c,include_s3=True))
+        allowed=e.import_plan(c,pd,accept_state_changes=[ra['id']])
+        self.assertEqual(allowed['discrepancies'],[])
+        self.assertEqual(e.import_pack(c,pd,allowed['plan_id'],
+                                       accept_state_changes=[ra['id']])['status'],'updated')
+        self.assertEqual(e.load_rows(c)['s1/records/'+ra['id']+'.json']['text'],'Changed same ID')
 
     def test_misplaced_profile_cli_guidance_has_no_mutation(self):
         before=e.profile_digest(self.root,include_s3=True)
@@ -180,6 +188,22 @@ class Components(unittest.TestCase):
         b=e.add_observation(self.root,dict(row,evidence=['Different real evidence placeholder']))
         self.assertNotEqual(a['record_id'],b['record_id'])
         self.assertTrue(all(r['environment']==row['environment'] for r in e.query(self.root,component='s2')['records']))
+
+    def test_s2_retire_marker_is_exempt_from_cause_fields(self):
+        """W3 (2026-09-13)：S2 停用标记只是维护动作，不再强制 cause/prevention/counter_signal/environment。"""
+        e.add(self.root,record('s2',id='a'*32,state='confirmed',confirmed_by='synthetic yes',
+                               text='待停用的 S2 条目'))
+        marker=record('s2',state='retired',supersedes='a'*32,
+                      text='停用上一条 S2 记录（原因直接写在正文里）')
+        for key in ('cause','prevention','counter_signal','environment'):
+            marker.pop(key,None)
+        result=e.add(self.root,marker)
+        self.assertEqual(result['status'],'added')
+        # 正常（非停用）S2 记录仍然必须有这四项
+        with self.assertRaises(ValueError):
+            e.add(self.root,{k:v for k,v in record('s2').items() if k!='cause'})
+        with self.assertRaises(ValueError):
+            e.add(self.root,{k:v for k,v in record('s2').items() if k!='environment'})
 
     def test_s3_context_old_unknown_and_filter(self):
         row=dict(task_id='old',text='old entry',evidence='synthetic')
@@ -264,11 +288,14 @@ class Components(unittest.TestCase):
         self.assertEqual(value['version'],cp.verify(e.CORE)['version'])
         base={'recall','personal-experience','error-review','migration','updates','backup','diagnostics'}
         dev_only={'skill-review','outcomes'}   # tied to the development edition's extra surfaces
+        # 2026-09-13：宿主规则提示只在"到期"时出现（首次/90 天后），是否到期取决于本机安装级状态，
+        # 因此这里把它当条件卡片，而不是固定集合的一部分。
+        conditional={'host-rule'}
         ids={c['id'] for c in value['capabilities']}
         self.assertTrue(base<=ids,'core capabilities must always be present')
-        self.assertTrue(ids<=(base|dev_only),'unexpected capability card')
+        self.assertTrue(ids<=(base|dev_only|conditional),'unexpected capability card')
         if optional_s3_enabled():
-            self.assertEqual(ids,base|dev_only)
+            self.assertTrue((base|dev_only)<=ids)
         self.assertIn(value['profile_state'],('bound-valid','needs-setup-or-repair','not-inspected'))
         for card in value['capabilities']:
             self.assertTrue(card['ability'] and card['example'] and card['advice'])
@@ -327,11 +354,18 @@ class Components(unittest.TestCase):
 
     def test_compat_and_feedback_docs_bound_to_manifest_and_gate(self):
         meta=e.read(e.CORE/'CORE.json')
+        import optional_features as features
+        if features.policy(e.CORE)['edition']=='public':
+            self.assertNotIn('references/compatibility-matrix.md',meta['files'])
+            self.assertIn('references/feedback-template.md',meta['files'])
+            return
         for rel in ('references/compatibility-matrix.md','references/feedback-template.md'):
             self.assertIn(rel,meta['files'])
             self.assertTrue(gate.permitted(rel))
         matrix=(e.CORE/'references/compatibility-matrix.md').read_text(encoding='utf-8')
-        self.assertIn('最低起点 v0.21.5-beta.1',matrix)
+        self.assertIn('保证基线 v1.0.0',matrix)
+        # 保证基线（v1.0.0）与技术可行下限（v0.21.5、宽松不拒绝）是两层，须同时写在文档里。
+        self.assertIn('技术可行下限',matrix)
         self.assertIn('core_api=2',matrix)
         template=(e.CORE/'references/feedback-template.md').read_text(encoding='utf-8')
         self.assertIn('unknown',template)
@@ -340,7 +374,7 @@ class Components(unittest.TestCase):
         import shutil
         clone=self.base/'core';shutil.copytree(e.CORE,clone,ignore=shutil.ignore_patterns('__pycache__'))
         path=clone/'scripts/experience.py';data=path.read_text(encoding='utf-8')
-        path.write_text(data.replace("sub.add_parser('observe-s1')","sub.add_parser('observe-s1-disabled')"),encoding='utf-8')
+        path.write_text(data.replace("sub.add_parser('s1-metrics')","sub.add_parser('s1-metrics-disabled')"),encoding='utf-8')
         meta=e.read(clone/'CORE.json');meta['version']='0.99.0';meta['files']['scripts/experience.py']=st.hash_file(path)
         (clone/'CORE.json').write_bytes(e.encoded(meta))
         value=e.introduction(core=clone)
@@ -524,7 +558,17 @@ class Components(unittest.TestCase):
         plan=e.import_plan(target,pack)
         self.assertTrue(any(c['id']==a['id'] and c['before']=='confirmed' and c['after']=='superseded'
                             for c in plan['rule_changes']['records']))
-        self.assertEqual(e.import_pack(target,pack,plan['plan_id'])['status'],'imported')
+        # 2026-09-13 用户规则：会改变本端状态的文件先被扣下、列入差异清单，不静默应用。
+        self.assertEqual([d['key'] for d in plan['discrepancies']],[a['id']])
+        self.assertTrue(plan['hold'])
+        self.assertEqual(e.import_pack(target,pack,plan['plan_id'])['status'],'unchanged')
+        rows=e.load_rows(target)
+        self.assertEqual(e.effective_states({r['id']:r for r in rows.values()})[a['id']],'confirmed')
+        # 放行后才会应用（plan-id 随放行集变化）
+        allowed=e.import_plan(target,pack,accept_state_changes=[a['id']])
+        self.assertEqual(allowed['discrepancies'],[])
+        self.assertEqual(e.import_pack(target,pack,allowed['plan_id'],
+                                       accept_state_changes=[a['id']])['status'],'imported')
         src=self.base/'src2';e.init(src,self.meta['profile_id'])
         first=event(source='synthetic:first');e.add_event(src,first)
         second=event(source='synthetic:second',text='Different brief');e.add_event(src,second)
@@ -534,7 +578,13 @@ class Components(unittest.TestCase):
         changed=[c for c in plan2['rule_changes']['preferences']
                  if c['preference_id']=='brief' and 'pending' in c.get('fields',[])]
         self.assertTrue(changed)
-        self.assertEqual(e.import_pack(target2,out,plan2['plan_id'])['status'],'imported')
+        # 2026-09-13 用户规则同样适用于偏好事件：会改变本端偏好状态的事件先被扣下并列入差异清单。
+        self.assertTrue(any(d['kind']=='preference' and d['preference_id']=='brief'
+                            for d in plan2['discrepancies']))
+        self.assertEqual(e.import_pack(target2,out,plan2['plan_id'])['status'],'unchanged')
+        allowed2=e.import_plan(target2,out,accept_state_changes=['work|brief'])
+        self.assertEqual(e.import_pack(target2,out,allowed2['plan_id'],
+                                       accept_state_changes=['work|brief'])['status'],'imported')
         reasons=[]
         for item in e.query(target2)['pending_preferences']:
             reasons += [p['reason'] for p in item.get('pending',[])]

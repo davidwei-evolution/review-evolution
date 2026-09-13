@@ -138,12 +138,26 @@ def doctor(profile=None, deep=False, core=e.CORE, allow_host_files=False):
     try:
         report['core']=cp.verify(core,allow_host_files=allow_host_files)
         report['checks']['core']='verified'
-    except (ValueError,OSError,KeyError,TypeError,AttributeError):
+    except (ValueError,OSError,KeyError,TypeError,AttributeError) as exc:
         report.update(status='CORE_INVALID',next_step='重新核对核心清单与安装来源，保留私人档案。')
+        # A host-file hint is safe only after hashes and all other checks pass.
+        if isinstance(exc,ValueError) and str(exc).startswith('Core has host bookkeeping files:'):
+            try:
+                cp.verify(core,allow_host_files=True)
+            except (ValueError,OSError,KeyError,TypeError,AttributeError):
+                report['next_step']='核心还有其他完整性问题；运行 core_package.py diff 核对，不用 --allow-host-files 掩盖改写。保留私人档案。'
+            else:
+                report['checks']['core']='host-files-only'
+                report['next_step']='核心内容已核对，仅发现宿主附加文件。确认后运行 experience.py doctor --allow-host-files；测试用 run_tests.py。不要改 CORE.json 或删除私人档案。'
+        elif isinstance(exc,ValueError) and str(exc).startswith('Core content mismatch:'):
+            report['next_step']='运行 core_package.py diff 核对改写文件；备份后用同版本原包复原，再重新校验。不要修改 CORE.json 迁就差异。'
         return report
     try:
         import optional_features as features
-        report['optional_modules']=features.status(core)
+        # 2026-09-13：对外单一形态、用户侧零内部模块痕迹——公开版不输出该板块（连键名都不出现）。
+        policy=features.status(core)
+        if policy.get('edition')=='development':
+            report['optional_modules']=policy
     except (ValueError,OSError,KeyError,TypeError,ImportError) as ex:
         report['optional_modules']={'error':str(ex)[:200]}
     report['installations']=other_installations(core)
@@ -198,7 +212,15 @@ def doctor(profile=None, deep=False, core=e.CORE, allow_host_files=False):
             e.load_update_ledger(root);e.trusted_sources_view(root)
             report['records_validation']='passed'
             report['counts']={'records':len(q['records']),'effective_preferences':len(q['effective_preferences'])}
-        report['next_step']='配置检查通过；实际写入能力以正常写入结果为准。'
+        mismatch=(report.get('installations') or {}).get('version_mismatch')
+        if mismatch:
+            # 2026-09-13（真机反馈 F3）：多份安装共用同一份档案，版本不一致会让召回口径对不上号，
+            # 因此把处置建议提升到顶层 next_step（此前只在 installations.note 里提过）。
+            report['next_step']=('检测到本机同一技能有多份安装且版本不一致（'+'、'.join(mismatch)+'）：'
+                                 '请先统一升级或移除重复安装，避免召回与校验口径不一致；'
+                                 '本次检查只针对当前这一份，实际写入能力以正常写入结果为准。')
+        else:
+            report['next_step']='配置检查通过；实际写入能力以正常写入结果为准。'
     except FileNotFoundError:
         report.update(status='PROFILE_INVALID',next_step='已有目录缺少必要文件或检查时发生变化；保留目录并核对备份。')
     except PermissionError:

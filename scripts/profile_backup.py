@@ -152,4 +152,4 @@ def restore(path,target,plan_id):
             raise ValueError('Restored files changed during validation')
     publish_directory(target,write)
     return {'status':'RESTORED','backup_id':manifest['backup_id'],'binding_changed':False,
-            'next_step':'先显式指定新档案运行 status、query、query-s3、s1-metrics 和 s2-metrics；确认后才切换绑定。'}
+            'next_step':'先显式指定新档案运行 status、query、s1-metrics 和 s2-metrics；确认后才切换绑定。'}

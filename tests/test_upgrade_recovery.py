@@ -12,6 +12,7 @@ import json,re,subprocess,sys,tempfile,unittest
 CORE=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(CORE/'scripts'))
 sys.path.insert(0,str(CORE/'tests'))
+from test_components import optional_s3_enabled   # noqa: E402  (edition-aware assertions)
 import core_package as cp
 import diagnostics as dg
 import experience as e
@@ -136,6 +137,43 @@ class HostRewriteBlockedUpgrade(CorePair):
         self.assertIn('diff --root',result['next_step'])
 
 
+class HostRewriteRepair(CorePair):
+    """W1 (2026-09-13)：被宿主改写的目标核心，可用候选包同名官方文件修复后继续升级。
+
+    默认行为不变（仍然拒绝）；只有显式 repair_host_rewrite 才继续，且结束后必须整目录核验通过。
+    """
+
+    def test_default_still_refuses(self):
+        self.host_rewrite(self.target)
+        with self.assertRaises(ValueError) as ctx:
+            u.install_plan(self.candidate,self.target,True,'0.12.0')
+        self.assertIn('Target core invalid',str(ctx.exception))
+
+    def test_repair_plan_marks_the_file_and_install_restores_official_bytes(self):
+        self.host_rewrite(self.target)
+        plan=u.install_plan(self.candidate,self.target,True,'0.12.0',repair_host_rewrite=True)
+        self.assertEqual(sorted(plan['repair']['files']),['SKILL.md'])
+        self.assertTrue(plan['changes']['SKILL.md']['host_rewrite_repair'])
+        result=u.install(self.candidate,self.target,plan['plan_id'],True,'0.12.0',
+                         repair_host_rewrite=True)
+        self.assertEqual(result['status'],'UPDATED')
+        self.assertIn('候选包中的同名官方文件',result['message'])
+        self.assertEqual(cp.verify(self.target)['version'],'0.12.0')
+        self.assertEqual(st.hash_file(self.target/'SKILL.md'),st.hash_file(self.candidate/'SKILL.md'))
+
+    def test_repair_consent_is_bound_to_the_plan(self):
+        self.host_rewrite(self.target)
+        plan=u.install_plan(self.candidate,self.target,True,'0.12.0',repair_host_rewrite=True)
+        with self.assertRaises(ValueError) as ctx:
+            u.install(self.candidate,self.target,plan['plan_id'],True,'0.12.0')
+        self.assertIn('Target core invalid',str(ctx.exception))
+
+    def test_clean_target_is_unaffected_by_the_flag(self):
+        plan=u.install_plan(self.candidate,self.target,True,'0.12.0',repair_host_rewrite=True)
+        self.assertIsNone(plan['repair'])
+        self.assertNotIn('host_rewrite_repair',json.dumps(plan['changes']))
+
+
 class ReceiptTemplate(CorePair):
     def test_template_fills_hashes_and_only_needs_reviewer_and_reason(self):
         self.add_file(self.candidate,'references/added-helper.md',b'# synthetic helper\n')
@@ -191,10 +229,12 @@ class CapabilityChangeReported(CorePair):
         self.assertEqual(plan['edition'],'public')
         self.assertFalse(plan['s3_available'])
         self.assertIsNotNone(plan['capability_change'])
-        self.assertIn('旧 S3',plan['capability_change']['note'])
+        # 2026-09-13：提示语不再出现内部模块名（用户侧零痕迹），改为中性的“发行形态不同”。
+        note=plan['capability_change']['note']
+        self.assertIn('发行形态',note);self.assertNotIn('S3',note)
         result=u.install(self.candidate,self.target,plan['plan_id'],True,'0.12.0')
         self.assertEqual(result['edition'],'public')
-        self.assertIn('未附带可选 S3 模块',result['message'])
+        self.assertIn('发行形态',result['message']);self.assertNotIn('S3',result['message'])
 
     def test_no_capability_change_is_reported_when_the_module_stays(self):
         self.clone(self.target,'0.11.0',s3_available=True)
@@ -310,7 +350,12 @@ class SmallFixes(CorePair):
         self.assertIn('只让宿主记',body)
         from test_skill_metadata import read_frontmatter
         self.assertIn('默认双写',read_frontmatter(CORE/'SKILL.md')['description'])
-        host=(CORE/'references'/'host-integration.md').read_text(encoding='utf-8')
+        host_path=CORE/'references'/'host-integration.md'
+        if not host_path.exists():
+            # Public packages keep the user-facing dual-write rule, but do not ship
+            # maintainer guidance written for host integrators.
+            return
+        host=host_path.read_text(encoding='utf-8')
         self.assertIn('默认双写',host)
 
     def test_backup_error_suggests_a_new_directory_name(self):
@@ -323,7 +368,11 @@ class SmallFixes(CorePair):
 
     def test_doctor_reports_modules_and_all_local_installations(self):
         report=dg.doctor(core=CORE)
-        self.assertIn('optional_modules',report)
+        # 2026-09-13（真机反馈 F2）：公开形态不再输出该板块（连键名都不出现）；开发形态保留。
+        if optional_s3_enabled():
+            self.assertIn('optional_modules',report)
+        else:
+            self.assertNotIn('optional_modules',report)
         self.assertIn('installations',report)
         self.assertGreaterEqual(report['installations']['count'],1)
         self.assertTrue(report['installations']['read_only'])

@@ -129,13 +129,17 @@ class PublicIdentityStaysAllowed(unittest.TestCase):
         self.assertIn(('review-evolution','wb-review-evolution'),pairs)
 
     def test_public_identity_payload_passes_the_content_gate(self):
-        data=gate.load_payload(e.CORE)
-        meta=json.loads(data['CORE.json'])
-        meta['canonical_name']='review-evolution'
-        data['CORE.json']=st.json_bytes(meta)
+        try:
+            import build_public
+        except ModuleNotFoundError:
+            self.skipTest('Public candidate: the development builder is intentionally absent')
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=Path(tmp)/'candidate'
+            build_public.build(e.CORE,candidate)
+            data=gate.load_payload(candidate)
+            review=gate.draft(candidate)
         # 1.0 (2026-09-12): the shipped core is a stable release, so the gate additionally requires
         # the stable_evidence block. Supply a synthetic receipt instead of relaxing the gate.
-        review=gate.draft(e.CORE)
         review['stable_evidence'].update(
             tests_evidence='Synthetic fixture reference',
             acceptance_evidence='Synthetic fixture reference; not publication approval',
